@@ -4,6 +4,7 @@ import de.t14d3.spool.core.EntityManager;
 import de.t14d3.spool.core.Persister;
 import de.t14d3.spool.mapping.EntityMetadata;
 
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -36,14 +37,14 @@ public abstract class EntityRepository<T> {
                 idCol,
                 otherCols.isEmpty() ? "" : ", " + otherCols
         );
-        em.getExecutor().execute(ddl, java.util.List.of());
+        em.getExecutor().execute(ddl, List.of());
     }
 
     public T findById(Object id) {
         return em.find(clazz, id);
     }
 
-    public java.util.List<T> findAll() {
+    public List<T> findAll() {
         return em.getExecutor().findAll(clazz);
     }
 
