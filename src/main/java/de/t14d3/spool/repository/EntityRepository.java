@@ -18,8 +18,8 @@ import java.util.stream.Collectors;
  * Base repository that auto-generates table schema on initialization.
  */
 public abstract class EntityRepository<T> {
-    // Repository registry (class -> repository instance)
     private static final Map<Class<?>, EntityRepository<?>> REPOSITORY_REGISTRY = new ConcurrentHashMap<>();
+    private static final Set<Class<?>> CREATING_REPOSITORIES = ConcurrentHashMap.newKeySet();
 
     protected final EntityManager em;
     protected final Persister persister;
@@ -32,8 +32,6 @@ public abstract class EntityRepository<T> {
         this.md = EntityMetadata.of(clazz);
         this.persister = new Persister(em.getExecutor());
         ensureSchema();
-        // Register instance in registry
-        REPOSITORY_REGISTRY.put(clazz, this);
     }
 
     // Creates table based on entity metadata
@@ -63,20 +61,34 @@ public abstract class EntityRepository<T> {
      */
     @SuppressWarnings("unchecked")
     public static <T> EntityRepository<T> getRepository(EntityManager em, Class<T> entityClass) {
-        return (EntityRepository<T>) REPOSITORY_REGISTRY.computeIfAbsent(
-                entityClass,
-                cls -> createRepository(em, entityClass)
-        );
+        EntityRepository<?> repo = REPOSITORY_REGISTRY.get(entityClass);
+        if (repo != null) {
+            return (EntityRepository<T>) repo;
+        }
+
+        // Prevent recursive creation attempts
+        if (CREATING_REPOSITORIES.contains(entityClass)) {
+            throw new IllegalStateException("Circular dependency detected while creating repository for " + entityClass.getName());
+        }
+
+        try {
+            CREATING_REPOSITORIES.add(entityClass);
+            return (EntityRepository<T>) REPOSITORY_REGISTRY.computeIfAbsent(
+                    entityClass,
+                    cls -> createRepository(em, entityClass)
+            );
+        } finally {
+            CREATING_REPOSITORIES.remove(entityClass);
+        }
     }
 
     @SuppressWarnings("unchecked")
     private static <T> EntityRepository<T> createRepository(EntityManager em, Class<T> entityClass) {
         String entityPkg = entityClass.getPackageName();
-        String repoPkg   = entityPkg + ".repository";
+        String repoPkg = entityPkg + ".repository";
         Set<URL> urls = new HashSet<>();
         urls.addAll(ClasspathHelper.forPackage(repoPkg));
         urls.addAll(ClasspathHelper.forPackage(entityPkg));
-
 
         Reflections reflections = new Reflections(
                 new ConfigurationBuilder()
