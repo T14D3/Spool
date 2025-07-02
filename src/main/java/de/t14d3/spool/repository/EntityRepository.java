@@ -10,10 +10,7 @@ import org.reflections.util.ClasspathHelper;
 import org.reflections.util.ConfigurationBuilder;
 
 import java.net.URL;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
@@ -76,7 +73,8 @@ public abstract class EntityRepository<T> {
     private static <T> EntityRepository<T> createRepository(EntityManager em, Class<T> entityClass) {
         String entityPkg = entityClass.getPackageName();
         String repoPkg   = entityPkg + ".repository";
-        Collection<URL> urls = ClasspathHelper.forPackage(repoPkg);
+        Set<URL> urls = new HashSet<>();
+        urls.addAll(ClasspathHelper.forPackage(repoPkg));
         urls.addAll(ClasspathHelper.forPackage(entityPkg));
 
 
