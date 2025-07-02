@@ -16,7 +16,9 @@ public class EntityMetadata {
     private final String tableName;
     private final String idColumn;
     private final Field idField;
+    private final String idType; // Add field to store ID type
     private final List<String> columns;
+    private final List<String> columnTypes;
     private final List<Field> fields;
 
     private EntityMetadata(Class<?> cls) {
@@ -29,7 +31,9 @@ public class EntityMetadata {
 
         Field idFieldTemp = null;
         String idColumnTemp = null;
+        String idTypeTemp = null;
         List<String> cols = new ArrayList<>();
+        List<String> types = new ArrayList<>();
         List<Field> flds = new ArrayList<>();
 
         for (Field f : cls.getDeclaredFields()) {
@@ -39,11 +43,14 @@ public class EntityMetadata {
                     throw new OrmException("Multiple @Id fields in class: " + cls);
                 }
                 idFieldTemp = f;
+                Id idAnnotation = f.getAnnotation(Id.class);
+                idTypeTemp = idAnnotation.type();
                 Column col = f.getAnnotation(Column.class);
                 idColumnTemp = (col != null && !col.name().isEmpty()) ? col.name() : f.getName();
             } else if (f.isAnnotationPresent(Column.class)) {
                 Column col = f.getAnnotation(Column.class);
                 cols.add(!col.name().isEmpty() ? col.name() : f.getName());
+                types.add(!col.type().isEmpty() ? col.type() : "VARCHAR(255)"); // Default type
                 flds.add(f);
             }
         }
@@ -54,7 +61,9 @@ public class EntityMetadata {
 
         this.idField = idFieldTemp;
         this.idColumn = idColumnTemp;
+        this.idType = idTypeTemp; // Store the ID type
         this.columns = Collections.unmodifiableList(cols);
+        this.columnTypes = Collections.unmodifiableList(types);
         this.fields = Collections.unmodifiableList(flds);
     }
 
@@ -78,8 +87,16 @@ public class EntityMetadata {
         return idField;
     }
 
+    public String getIdType() {
+        return idType;
+    }
+
     public List<String> getColumns() {
         return columns;
+    }
+
+    public List<String> getColumnTypes() {
+        return columnTypes;
     }
 
     public List<Field> getFields() {

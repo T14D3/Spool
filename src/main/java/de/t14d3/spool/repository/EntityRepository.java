@@ -37,14 +37,23 @@ public abstract class EntityRepository<T> {
     // Creates table based on entity metadata
     protected void ensureSchema() {
         String idCol = md.getIdColumn();
+        String idType = md.getIdType();
         String table = md.getTableName();
-        String otherCols = md.getColumns().stream()
-                .map(c -> c + " VARCHAR(255)")
-                .collect(Collectors.joining(", "));
+        List<String> columns = md.getColumns();
+        List<String> columnTypes = md.getColumnTypes();
+        String otherCols = "";
+        if (!columns.isEmpty()) {
+            List<String> colDefs = new ArrayList<>();
+            for (int i = 0; i < columns.size(); i++) {
+                colDefs.add(columns.get(i) + " " + columnTypes.get(i));
+            }
+            otherCols = String.join(", ", colDefs);
+        }
         String ddl = String.format(
-                "CREATE TABLE IF NOT EXISTS %s (%s BIGINT PRIMARY KEY%s)",
+                "CREATE TABLE IF NOT EXISTS %s (%s %s PRIMARY KEY%s)",
                 table,
                 idCol,
+                idType,
                 otherCols.isEmpty() ? "" : ", " + otherCols
         );
         em.getExecutor().execute(ddl, List.of());
