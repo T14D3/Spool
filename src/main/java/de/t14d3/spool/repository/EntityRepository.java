@@ -35,7 +35,7 @@ public abstract class EntityRepository<T> {
     }
 
     // Creates table based on entity metadata
-    private void ensureSchema() {
+    protected void ensureSchema() {
         String idCol = md.getIdColumn();
         String table = md.getTableName();
         String otherCols = md.getColumns().stream()
