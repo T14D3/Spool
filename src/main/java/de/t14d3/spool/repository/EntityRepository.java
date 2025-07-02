@@ -5,7 +5,12 @@ import de.t14d3.spool.core.EntityManager;
 import de.t14d3.spool.core.Persister;
 import de.t14d3.spool.mapping.EntityMetadata;
 import org.reflections.Reflections;
+import org.reflections.scanners.Scanners;
+import org.reflections.util.ClasspathHelper;
+import org.reflections.util.ConfigurationBuilder;
 
+import java.net.URL;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -69,10 +74,19 @@ public abstract class EntityRepository<T> {
 
     @SuppressWarnings("unchecked")
     private static <T> EntityRepository<T> createRepository(EntityManager em, Class<T> entityClass) {
-        // use Reflections to find all repos annotated with @Repository(entityClass)
-        Reflections refl = new Reflections("de.t14d3.spool");
-        Set<Class<?>> candidates = refl.getTypesAnnotatedWith(Repository.class);
-        for (Class<?> repoCls : candidates) {
+        String entityPkg = entityClass.getPackageName();
+        String repoPkg   = entityPkg + ".repository";
+        Collection<URL> urls = ClasspathHelper.forPackage(repoPkg);
+        urls.addAll(ClasspathHelper.forPackage(entityPkg));
+
+
+        Reflections reflections = new Reflections(
+                new ConfigurationBuilder()
+                        .setUrls(urls)
+                        .setScanners(Scanners.TypesAnnotated)
+        );
+
+        for (Class<?> repoCls : reflections.getTypesAnnotatedWith(Repository.class)) {
             Repository ann = repoCls.getAnnotation(Repository.class);
             if (ann.value().equals(entityClass)) {
                 try {
@@ -84,9 +98,12 @@ public abstract class EntityRepository<T> {
                 }
             }
         }
-        throw new IllegalStateException("No @Repository(" + entityClass.getName() + ") found");
-    }
 
+        throw new IllegalStateException(
+                "No @Repository(" + entityClass.getName() + ") found in packages: "
+                        + entityPkg + " or " + repoPkg
+        );
+    }
 
     public T findById(Object id) {
         return em.find(clazz, id);
