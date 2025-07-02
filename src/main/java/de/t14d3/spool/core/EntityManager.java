@@ -7,6 +7,8 @@ import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.mapping.EntityScanner;
 
 public class EntityManager {
+    private static EntityManager INSTANCE;
+
     private final DatabaseConnection db;
     private final UnitOfWork uow;
 
@@ -14,6 +16,20 @@ public class EntityManager {
         this.db = new DatabaseConnection(url);
         this.uow = new UnitOfWork();
         EntityScanner.scan();
+    }
+
+    public static void initialize(String jdbcUrl) {
+        if (INSTANCE != null) {
+            throw new IllegalStateException("EntityManager already initialized");
+        }
+        INSTANCE = new EntityManager(jdbcUrl);
+    }
+
+    public static EntityManager getInstance() {
+        if (INSTANCE == null) {
+            throw new IllegalStateException("EntityManager not initialized. Call initialize() first.");
+        }
+        return INSTANCE;
     }
 
     public static EntityManager create(String jdbcUrl) {
@@ -62,6 +78,8 @@ public class EntityManager {
 
     public void close() {
         db.close();
+        // Reset instance when closed
+        INSTANCE = null;
     }
 
     public QueryExecutor getExecutor() {
