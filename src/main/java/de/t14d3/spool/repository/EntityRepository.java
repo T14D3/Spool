@@ -1,11 +1,14 @@
 package de.t14d3.spool.repository;
 
+import de.t14d3.spool.annotations.Repository;
 import de.t14d3.spool.core.EntityManager;
 import de.t14d3.spool.core.Persister;
 import de.t14d3.spool.mapping.EntityMetadata;
+import org.reflections.Reflections;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
@@ -66,25 +69,24 @@ public abstract class EntityRepository<T> {
 
     @SuppressWarnings("unchecked")
     private static <T> EntityRepository<T> createRepository(EntityManager em, Class<T> entityClass) {
-        try {
-            // Generate repository class name (convention: EntityName + "Repository")
-            String repoClassName = entityClass.getName() + "Repository";
-            Class<?> repoClass = Class.forName(repoClassName);
-
-            // Verify repository type
-            if (!EntityRepository.class.isAssignableFrom(repoClass)) {
-                throw new IllegalStateException(repoClassName + " is not an EntityRepository");
+        // use Reflections to find all repos annotated with @Repository(entityClass)
+        Reflections refl = new Reflections("de.t14d3.spool");
+        Set<Class<?>> candidates = refl.getTypesAnnotatedWith(Repository.class);
+        for (Class<?> repoCls : candidates) {
+            Repository ann = repoCls.getAnnotation(Repository.class);
+            if (ann.value().equals(entityClass)) {
+                try {
+                    return (EntityRepository<T>) repoCls
+                            .getDeclaredConstructor(EntityManager.class)
+                            .newInstance(em);
+                } catch (ReflectiveOperationException e) {
+                    throw new IllegalStateException("Cannot instantiate " + repoCls, e);
+                }
             }
-
-            // Create repository instance
-            return (EntityRepository<T>) repoClass
-                    .getDeclaredConstructor(EntityManager.class, entityClass)
-                    .newInstance(em, entityClass);
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to create repository for " +
-                    entityClass.getName(), e);
         }
+        throw new IllegalStateException("No @Repository(" + entityClass.getName() + ") found");
     }
+
 
     public T findById(Object id) {
         return em.find(clazz, id);
