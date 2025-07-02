@@ -4,6 +4,7 @@ import de.t14d3.spool.core.EntityManager;
 import de.t14d3.spool.core.Persister;
 import de.t14d3.spool.mapping.EntityMetadata;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -66,24 +67,38 @@ public abstract class EntityRepository<T> {
 
     @SuppressWarnings("unchecked")
     private static <T> EntityRepository<T> createRepository(EntityManager em, Class<T> entityClass) {
-        try {
-            // Generate repository class name (convention: EntityName + "Repository")
-            String repoClassName = entityClass.getName() + "Repository";
-            Class<?> repoClass = Class.forName(repoClassName);
-
-            // Verify repository type
-            if (!EntityRepository.class.isAssignableFrom(repoClass)) {
-                throw new IllegalStateException(repoClassName + " is not an EntityRepository");
-            }
-
-            // Create repository instance
-            return (EntityRepository<T>) repoClass
-                    .getDeclaredConstructor(EntityManager.class, entityClass)
-                    .newInstance(em, entityClass);
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to create repository for " +
-                    entityClass.getName(), e);
+        String pkg = entityClass.getPackageName();
+        String simpleName = entityClass.getSimpleName();
+        // derive possible base names: exact simpleName, and if it endsWith "Entity" also the trimmed variant
+        List<String> candidates = new ArrayList<>();
+        candidates.add(simpleName);
+        if (simpleName.endsWith("Entity")) {
+            candidates.add(simpleName.substring(0, simpleName.length() - "Entity".length()));
         }
+
+        for (String base : candidates) {
+            String repoFqn = pkg + "." + base + "Repository";
+            try {
+                Class<?> repoClass = Class.forName(repoFqn);
+                if (!EntityRepository.class.isAssignableFrom(repoClass)) {
+                    throw new IllegalStateException(repoFqn + " is not an EntityRepository");
+                }
+                return (EntityRepository<T>) repoClass
+                        .getDeclaredConstructor(EntityManager.class, Class.class)
+                        .newInstance(em, entityClass);
+            } catch (ClassNotFoundException ignored) {
+                // try next candidate
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException("Failed to instantiate " + repoFqn, e);
+            }
+        }
+
+        throw new IllegalStateException(
+                "No repository found for entity " + entityClass.getName() +
+                        ". Tried: " + candidates.stream()
+                        .map(c -> pkg + "." + c + "Repository")
+                        .collect(Collectors.joining(", "))
+        );
     }
 
     public T findById(Object id) {
