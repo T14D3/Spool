@@ -89,8 +89,8 @@ public abstract class EntityRepository<T> {
             if (ann.value().equals(entityClass)) {
                 try {
                     return (EntityRepository<T>) repoCls
-                            .getDeclaredConstructor(EntityManager.class)
-                            .newInstance(em);
+                            .getDeclaredConstructor(EntityManager.class, Class.class)
+                            .newInstance(em, entityClass);
                 } catch (ReflectiveOperationException e) {
                     throw new IllegalStateException("Cannot instantiate " + repoCls, e);
                 }
