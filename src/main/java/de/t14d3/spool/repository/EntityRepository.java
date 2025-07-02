@@ -5,6 +5,7 @@ import de.t14d3.spool.core.Persister;
 import de.t14d3.spool.mapping.EntityMetadata;
 
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
@@ -42,6 +43,18 @@ public abstract class EntityRepository<T> {
 
     public T findById(Object id) {
         return em.find(clazz, id);
+    }
+
+    public List<T> findBy(Map<String, Object> criteria) {
+        return em.getExecutor().findBy(clazz, criteria);
+    }
+
+    public List<T> findBy(Map<String, Object> criteria, String orderBy, int limit, int offset) {
+        return em.getExecutor().findBy(clazz, criteria, orderBy, limit, offset);
+    }
+
+    public T findOneBy(Map<String, Object> criteria) {
+        return em.getExecutor().findOneBy(clazz, criteria);
     }
 
     public List<T> findAll() {

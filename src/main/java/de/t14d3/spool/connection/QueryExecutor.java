@@ -3,9 +3,10 @@ package de.t14d3.spool.connection;
 import de.t14d3.spool.exceptions.OrmException;
 import de.t14d3.spool.mapping.EntityMetadata;
 
+import java.lang.reflect.Field;
 import java.sql.*;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
+import java.util.stream.Collectors;
 
 public class QueryExecutor {
     private final Connection conn;
@@ -34,16 +35,7 @@ public class QueryExecutor {
                 if (!rs.next()) {
                     return null;
                 }
-                T entity = cls.getDeclaredConstructor().newInstance();
-                // set ID field
-                md.getIdField().set(entity, rs.getObject(md.getIdColumn()));
-                // set other columns
-                for (int i = 0; i < md.getColumns().size(); i++) {
-                    String col = md.getColumns().get(i);
-                    Object val = rs.getObject(col);
-                    md.getFields().get(i).set(entity, val);
-                }
-                return entity;
+                return mapRowToEntity(rs, cls, md);
             }
         } catch (Exception e) {
             throw new OrmException(e);
@@ -53,23 +45,116 @@ public class QueryExecutor {
     public <T> List<T> findAll(Class<T> cls) {
         EntityMetadata md = EntityMetadata.of(cls);
         String sql = String.format("SELECT * FROM %s", md.getTableName());
-        List<T> list = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(sql);
              ResultSet rs = ps.executeQuery()) {
-
+            List<T> results = new ArrayList<>();
             while (rs.next()) {
-                T entity = cls.getDeclaredConstructor().newInstance();
-                md.getIdField().set(entity, rs.getObject(md.getIdColumn()));
-                for (int i = 0; i < md.getColumns().size(); i++) {
-                    String col = md.getColumns().get(i);
-                    Object val = rs.getObject(col);
-                    md.getFields().get(i).set(entity, val);
-                }
-                list.add(entity);
+                results.add(mapRowToEntity(rs, cls, md));
             }
-            return list;
+            return results;
         } catch (Exception e) {
             throw new OrmException(e);
         }
+    }
+
+    public <T> List<T> findBy(Class<T> cls, Map<String, Object> criteria) {
+        return findBy(cls, criteria, null, -1, -1);
+    }
+
+    public <T> T findOneBy(Class<T> cls, Map<String, Object> criteria) {
+        List<T> results = findBy(cls, criteria, null, 1, -1);
+        return results.isEmpty() ? null : results.get(0);
+    }
+
+    public <T> List<T> findBy(Class<T> cls, Map<String, Object> criteria, String orderBy, int limit, int offset) {
+        if (criteria == null || criteria.isEmpty()) {
+            throw new OrmException("Criteria cannot be null or empty");
+        }
+
+        EntityMetadata md = EntityMetadata.of(cls);
+        Map<String, String> fieldToColumnMap = createFieldToColumnMap(md);
+        List<String> whereClauses = new ArrayList<>();
+        List<Object> params = new ArrayList<>();
+
+        // Build WHERE clauses and parameters
+        for (Map.Entry<String, Object> entry : criteria.entrySet()) {
+            String fieldName = entry.getKey();
+            String column = fieldToColumnMap.get(fieldName);
+
+            if (column == null) {
+                throw new OrmException("Unknown field: " + fieldName);
+            }
+
+            whereClauses.add(column + " = ?");
+            params.add(entry.getValue());
+        }
+
+        // Build SQL query
+        String sql = "SELECT * FROM " + md.getTableName() +
+                " WHERE " + String.join(" AND ", whereClauses);
+
+        if (orderBy != null) {
+            sql += " ORDER BY " + orderBy;
+        }
+        if (limit > 0) {
+            sql += " LIMIT " + limit;
+        }
+        if (offset > 0) {
+            sql += " OFFSET " + offset;
+        }
+
+        // Execute query
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            for (int i = 0; i < params.size(); i++) {
+                ps.setObject(i + 1, params.get(i));
+            }
+
+            try (ResultSet rs = ps.executeQuery()) {
+                List<T> results = new ArrayList<>();
+                while (rs.next()) {
+                    results.add(mapRowToEntity(rs, cls, md));
+                }
+                return results;
+            }
+        } catch (Exception e) {
+            throw new OrmException(e);
+        }
+    }
+
+    private Map<String, String> createFieldToColumnMap(EntityMetadata md) {
+        Map<String, String> map = new HashMap<>();
+
+        // Add ID field
+        map.put(md.getIdField().getName(), md.getIdColumn());
+
+        // Add regular fields
+        List<Field> fields = md.getFields();
+        List<String> columns = md.getColumns();
+        for (int i = 0; i < fields.size(); i++) {
+            map.put(fields.get(i).getName(), columns.get(i));
+        }
+
+        return map;
+    }
+
+    private <T> T mapRowToEntity(ResultSet rs, Class<T> cls, EntityMetadata md)
+            throws Exception {
+        T entity = cls.getDeclaredConstructor().newInstance();
+
+        // Set ID field
+        Field idField = md.getIdField();
+        idField.setAccessible(true);
+        idField.set(entity, rs.getObject(md.getIdColumn()));
+
+        // Set other fields
+        List<Field> fields = md.getFields();
+        List<String> columns = md.getColumns();
+        for (int i = 0; i < fields.size(); i++) {
+            Field field = fields.get(i);
+            field.setAccessible(true);
+            field.set(entity, rs.getObject(columns.get(i)));
+        }
+
+        return entity;
     }
 }
