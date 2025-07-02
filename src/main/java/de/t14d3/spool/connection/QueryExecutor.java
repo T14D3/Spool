@@ -57,54 +57,77 @@ public class QueryExecutor {
         }
     }
 
+    public <T> T findOneBy(Class<T> cls, Map<String, Object> criteria) {
+        return findOneBy(cls, criteria, null);
+    }
+
+    public <T> T findOneBy(Class<T> cls, Map<String, Object> criteria, String orderBy) {
+        List<T> results = findBy(cls, criteria, orderBy, 1);
+        return results.isEmpty() ? null : results.get(0);
+    }
+
     public <T> List<T> findBy(Class<T> cls, Map<String, Object> criteria) {
         return findBy(cls, criteria, null, -1, -1);
     }
 
-    public <T> T findOneBy(Class<T> cls, Map<String, Object> criteria) {
-        List<T> results = findBy(cls, criteria, null, 1, -1);
-        return results.isEmpty() ? null : results.get(0);
+    public <T> List<T> findBy(Class<T> cls, Map<String, Object> criteria, String orderBy) {
+        return findBy(cls, criteria, orderBy, -1, -1);
+    }
+
+    public <T> List<T> findBy(Class<T> cls, Map<String, Object> criteria, int limit) {
+        return findBy(cls, criteria, null, limit, -1);
+    }
+
+    public <T> List<T> findBy(Class<T> cls, Map<String, Object> criteria, String orderBy, int limit) {
+        return findBy(cls, criteria, orderBy, limit, -1);
+    }
+
+    public <T> List<T> findBy(Class<T> cls, Map<String, Object> criteria, int limit, int offset) {
+        return findBy(cls, criteria, null, limit, offset);
     }
 
     public <T> List<T> findBy(Class<T> cls, Map<String, Object> criteria, String orderBy, int limit, int offset) {
-        if (criteria == null || criteria.isEmpty()) {
-            throw new OrmException("Criteria cannot be null or empty");
-        }
-
         EntityMetadata md = EntityMetadata.of(cls);
         Map<String, String> fieldToColumnMap = createFieldToColumnMap(md);
         List<String> whereClauses = new ArrayList<>();
         List<Object> params = new ArrayList<>();
 
-        // Build WHERE clauses and parameters
-        for (Map.Entry<String, Object> entry : criteria.entrySet()) {
-            String fieldName = entry.getKey();
-            String column = fieldToColumnMap.get(fieldName);
+        // Handle criteria (optional)
+        if (criteria != null && !criteria.isEmpty()) {
+            for (Map.Entry<String, Object> entry : criteria.entrySet()) {
+                String fieldName = entry.getKey();
+                String column = fieldToColumnMap.get(fieldName);
 
-            if (column == null) {
-                throw new OrmException("Unknown field: " + fieldName);
+                if (column == null) {
+                    throw new OrmException("Unknown field: " + fieldName);
+                }
+
+                whereClauses.add(column + " = ?");
+                params.add(entry.getValue());
             }
-
-            whereClauses.add(column + " = ?");
-            params.add(entry.getValue());
         }
 
         // Build SQL query
-        String sql = "SELECT * FROM " + md.getTableName() +
-                " WHERE " + String.join(" AND ", whereClauses);
+        StringBuilder sql = new StringBuilder("SELECT * FROM ").append(md.getTableName());
 
-        if (orderBy != null) {
-            sql += " ORDER BY " + orderBy;
+        if (!whereClauses.isEmpty()) {
+            sql.append(" WHERE ").append(String.join(" AND ", whereClauses));
         }
+
+        if (orderBy != null && !orderBy.trim().isEmpty()) {
+            sql.append(" ORDER BY ").append(orderBy);
+        }
+
         if (limit > 0) {
-            sql += " LIMIT " + limit;
+            sql.append(" LIMIT ").append(limit);
         }
+
         if (offset > 0) {
-            sql += " OFFSET " + offset;
+            sql.append(" OFFSET ").append(offset);
         }
 
         // Execute query
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             for (int i = 0; i < params.size(); i++) {
                 ps.setObject(i + 1, params.get(i));
             }
