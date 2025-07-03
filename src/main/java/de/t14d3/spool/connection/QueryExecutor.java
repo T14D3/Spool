@@ -5,6 +5,7 @@ import de.t14d3.spool.mapping.EntityMetadata;
 
 import java.lang.reflect.Field;
 import java.sql.*;
+import java.sql.Date;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -164,20 +165,117 @@ public class QueryExecutor {
             throws Exception {
         T entity = cls.getDeclaredConstructor().newInstance();
 
-        // Set ID field
+        // Map ID field
         Field idField = md.getIdField();
         idField.setAccessible(true);
-        idField.set(entity, rs.getObject(md.getIdColumn()));
+        Object rawId = rs.getObject(md.getIdColumn());
+        idField.set(entity, convertValue(rawId, idField.getType()));
 
-        // Set other fields
+        // Map other fields
         List<Field> fields = md.getFields();
         List<String> columns = md.getColumns();
         for (int i = 0; i < fields.size(); i++) {
             Field field = fields.get(i);
             field.setAccessible(true);
-            field.set(entity, rs.getObject(columns.get(i)));
+            Object raw = rs.getObject(columns.get(i));
+            Object converted = convertValue(raw, field.getType());
+            field.set(entity, converted);
         }
 
         return entity;
+    }
+
+    /**
+     * Convert raw JDBC value to target Java type.
+     */
+    private Object convertValue(Object value, Class<?> targetType) {
+        if (value == null) {
+            if (targetType.isPrimitive()) {
+                if (targetType == boolean.class) return false;
+                if (targetType == byte.class) return (byte) 0;
+                if (targetType == short.class) return (short) 0;
+                if (targetType == int.class) return 0;
+                if (targetType == long.class) return 0L;
+                if (targetType == float.class) return 0f;
+                if (targetType == double.class) return 0d;
+                if (targetType == char.class) return '\u0000';
+            }
+            return null;
+        }
+
+        // Boolean handling
+        if (targetType == boolean.class || targetType == Boolean.class) {
+            if (value instanceof Number) {
+                return ((Number) value).intValue() != 0;
+            }
+            if (value instanceof Boolean) {
+                return value;
+            }
+            throw new OrmException("Cannot convert " + value.getClass() + " to boolean");
+        }
+
+        // Numeric types
+        if (value instanceof Number num) {
+            if (targetType == byte.class || targetType == Byte.class) return num.byteValue();
+            if (targetType == short.class || targetType == Short.class) return num.shortValue();
+            if (targetType == int.class || targetType == Integer.class) return num.intValue();
+            if (targetType == long.class || targetType == Long.class) return num.longValue();
+            if (targetType == float.class || targetType == Float.class) return num.floatValue();
+            if (targetType == double.class || targetType == Double.class) return num.doubleValue();
+        }
+
+        // Date/time types
+        if (value instanceof Timestamp && targetType == java.util.Date.class) {
+            return new java.util.Date(((Timestamp) value).getTime());
+        }
+        if (value instanceof java.sql.Date && targetType == java.util.Date.class) {
+            return new java.util.Date(((java.sql.Date) value).getTime());
+        }
+        if (value instanceof Time && targetType == java.util.Date.class) {
+            return new java.util.Date(((Time) value).getTime());
+        }
+
+        // String
+        if (targetType == String.class && !(value instanceof String)) {
+            return value.toString();
+        }
+
+        // Enum
+        if (targetType.isEnum()) {
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            Class<? extends Enum> enumType = (Class<? extends Enum>) targetType;
+            //noinspection unchecked
+            return Enum.valueOf(enumType, value.toString());
+        }
+
+        // Blob to byte[]
+        if (value instanceof Blob blob && targetType == byte[].class) {
+            try {
+                byte[] bytes = blob.getBytes(1, (int) blob.length());
+                blob.free();
+                return bytes;
+            } catch (SQLException e) {
+                throw new OrmException(e);
+            }
+        }
+
+        // Clob to String
+        if (value instanceof Clob && targetType == String.class) {
+            Clob clob = (Clob) value;
+            try {
+                String text = clob.getSubString(1, (int) clob.length());
+                clob.free();
+                return text;
+            } catch (SQLException e) {
+                throw new OrmException(e);
+            }
+        }
+
+        // Fallback
+        if (targetType.isAssignableFrom(value.getClass())) {
+            return value;
+        }
+
+        throw new OrmException("Unsupported mapping from " + value.getClass() + " to " + targetType);
     }
 }
