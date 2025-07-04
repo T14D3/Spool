@@ -81,7 +81,7 @@ public class EntityMetadata {
         return tableName;
     }
 
-    public boolean isAutoIncrement() { return autoIncrement; } // New getter for auto-increment
+    public boolean isAutoIncrement() { return autoIncrement; }
 
     public String getIdColumn() {
         return idColumn;

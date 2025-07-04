@@ -15,18 +15,23 @@ public class Persister {
     }
 
     public <T> void insert(T entity, EntityMetadata md) {
-        if (md.isAutoIncrement() && md.idValue(entity) == null) {
-            Long nextId = getNextId(md);
-            try {
-                md.getIdField().set(entity, nextId);
-            } catch (IllegalAccessException e) {
-                throw new RuntimeException("Failed to set auto-incremented ID", e);
-            }
+        List<String> cols;
+        List<Object> values;
+
+        if (md.isAutoIncrement()) {
+            // Let the database assign the auto-increment ID
+            cols = md.getColumns();
+            values = md.values(entity);
+        } else {
+            // Include ID column explicitly when not auto-increment
+            cols = new ArrayList<>();
+            cols.add(md.getIdColumn());
+            cols.addAll(md.getColumns());
+
+            values = new ArrayList<>();
+            values.add(md.idValue(entity));
+            values.addAll(md.values(entity));
         }
-        // include ID column as first
-        List<String> cols = new ArrayList<>();
-        cols.add(md.getIdColumn());
-        cols.addAll(md.getColumns());
 
         String columns = String.join(", ", cols);
         String params = cols.stream()
@@ -39,10 +44,6 @@ public class Persister {
                 columns,
                 params
         );
-
-        List<Object> values = new ArrayList<>();
-        values.add(md.idValue(entity));
-        values.addAll(md.values(entity));
 
         executor.execute(sql, values);
     }
