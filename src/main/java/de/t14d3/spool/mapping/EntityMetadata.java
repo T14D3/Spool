@@ -17,6 +17,7 @@ public class EntityMetadata {
     private final String idColumn;
     private final Field idField;
     private final String idType; // Add field to store ID type
+    private boolean autoIncrement; // New field to store auto-increment flag
     private final List<String> columns;
     private final List<String> columnTypes;
     private final List<Field> fields;
@@ -45,6 +46,7 @@ public class EntityMetadata {
                 idFieldTemp = f;
                 Id idAnnotation = f.getAnnotation(Id.class);
                 idTypeTemp = idAnnotation.type();
+                this.autoIncrement = idAnnotation.autoIncrement(); // Check for auto-increment
                 Column col = f.getAnnotation(Column.class);
                 idColumnTemp = (col != null && !col.name().isEmpty()) ? col.name() : f.getName();
             } else if (f.isAnnotationPresent(Column.class)) {
@@ -78,6 +80,8 @@ public class EntityMetadata {
     public String getTableName() {
         return tableName;
     }
+
+    public boolean isAutoIncrement() { return autoIncrement; } // New getter for auto-increment
 
     public String getIdColumn() {
         return idColumn;

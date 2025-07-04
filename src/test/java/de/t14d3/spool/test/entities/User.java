@@ -8,7 +8,7 @@ import de.t14d3.spool.annotations.Table;
 @Entity
 @Table(name = "users")
 public class User {
-    @Id
+    @Id(autoIncrement = true)
     @Column(name = "id")
     private Long id;
 

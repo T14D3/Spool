@@ -15,6 +15,14 @@ public class Persister {
     }
 
     public <T> void insert(T entity, EntityMetadata md) {
+        if (md.isAutoIncrement() && md.idValue(entity) == null) {
+            Long nextId = getNextId(md);
+            try {
+                md.getIdField().set(entity, nextId);
+            } catch (IllegalAccessException e) {
+                throw new RuntimeException("Failed to set auto-incremented ID", e);
+            }
+        }
         // include ID column as first
         List<String> cols = new ArrayList<>();
         cols.add(md.getIdColumn());
@@ -67,5 +75,11 @@ public class Persister {
         params.add(md.idValue(entity));
 
         executor.execute(sql, params);
+    }
+
+    private <T> Long getNextId(EntityMetadata md) {
+        String sql = String.format("SELECT MAX(%s) FROM %s", md.getIdColumn(), md.getTableName());
+        Long maxId = executor.queryForLong(sql);
+        return maxId != null ? maxId + 1 : 1L;
     }
 }

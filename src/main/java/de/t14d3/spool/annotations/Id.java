@@ -6,4 +6,5 @@ import java.lang.annotation.*;
 @Target(ElementType.FIELD)
 public @interface Id {
     String type() default "BIGINT";
+    boolean autoIncrement() default false; // New property for auto-increment
 }

@@ -278,4 +278,17 @@ public class QueryExecutor {
 
         throw new OrmException("Unsupported mapping from " + value.getClass() + " to " + targetType);
     }
+
+    public Long queryForLong(String sql) {
+        try (PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            if (rs.next()) {
+                long value = rs.getLong(1);
+                return rs.wasNull() ? null : value;
+            }
+            return null;
+        } catch (SQLException e) {
+            throw new OrmException("Failed to execute scalar query: " + sql, e);
+        }
+    }
 }
