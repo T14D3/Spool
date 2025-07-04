@@ -25,7 +25,9 @@ public class Persister {
         List<String> cols = new ArrayList<>(md.getColumns());
         List<Object> vals = new ArrayList<>(md.values(entity));
 
-        if (auto && md.idValue(entity) == null) {
+        Object idVal = md.idValue(entity);
+        boolean isUnset = idVal == null || (idVal instanceof Number && ((Number) idVal).intValue() == 0);
+        if (auto && isUnset) {
             // omit ID so DB auto-generates
             String columnList = String.join(", ", cols);
             String paramList  = cols.stream().map(c -> "?").collect(Collectors.joining(", "));
