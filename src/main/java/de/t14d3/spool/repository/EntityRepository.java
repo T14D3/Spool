@@ -39,22 +39,29 @@ public abstract class EntityRepository<T> {
         String idCol = md.getIdColumn();
         String idType = md.getIdType();
         String table = md.getTableName();
+
+        // Build ID column definition, include AUTO_INCREMENT in correct position for H2
+        String idDef = idCol + " " + idType
+                + (md.isAutoIncrement() ? " AUTO_INCREMENT" : "")
+                + " PRIMARY KEY";
+
+        // Build other columns definitions
         List<String> columns = md.getColumns();
         List<String> columnTypes = md.getColumnTypes();
-        String otherCols = "";
+        String otherDefs = "";
         if (!columns.isEmpty()) {
-            List<String> colDefs = new ArrayList<>();
+            List<String> defs = new ArrayList<>();
             for (int i = 0; i < columns.size(); i++) {
-                colDefs.add(columns.get(i) + " " + columnTypes.get(i));
+                defs.add(columns.get(i) + " " + columnTypes.get(i));
             }
-            otherCols = String.join(", ", colDefs);
+            otherDefs = ", " + String.join(", ", defs);
         }
+
         String ddl = String.format(
-                "CREATE TABLE IF NOT EXISTS %s (%s %s PRIMARY KEY%s)",
+                "CREATE TABLE IF NOT EXISTS %s (%s%s)",
                 table,
-                idCol,
-                idType,
-                otherCols.isEmpty() ? "" : ", " + otherCols
+                idDef,
+                otherDefs
         );
         em.getExecutor().execute(ddl, List.of());
     }

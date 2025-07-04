@@ -44,8 +44,8 @@ public class RepositoryTest {
 
     @Test
     void testFindAll() {
-        User u1 = new User(11L, "frank", "frank@example.com");
-        User u2 = new User(12L, "grace", "grace@example.com");
+        User u1 = new User(null, "frank", "frank@example.com");
+        User u2 = new User(null, "grace", "grace@example.com");
         repo.save(u1);
         repo.save(u2);
         em.flush();

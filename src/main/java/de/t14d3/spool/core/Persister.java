@@ -1,8 +1,10 @@
 package de.t14d3.spool.core;
 
+import de.t14d3.spool.exceptions.OrmException;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.connection.QueryExecutor;
 
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -15,38 +17,52 @@ public class Persister {
     }
 
     public <T> void insert(T entity, EntityMetadata md) {
-        List<String> cols;
-        List<Object> values;
+        boolean auto = md.isAutoIncrement();
+        String table = md.getTableName();
+        String idCol = md.getIdColumn();
 
-        if (md.isAutoIncrement()) {
-            // Let the database assign the auto-increment ID
-            cols = md.getColumns();
-            values = md.values(entity);
+        // Prepare column list and values
+        List<String> cols = new ArrayList<>(md.getColumns());
+        List<Object> vals = new ArrayList<>(md.values(entity));
+
+        if (auto && md.idValue(entity) == null) {
+            // omit ID so DB auto-generates
+            String columnList = String.join(", ", cols);
+            String paramList  = cols.stream().map(c -> "?").collect(Collectors.joining(", "));
+            String sql = String.format("INSERT INTO %s (%s) VALUES (%s)", table, columnList, paramList);
+
+            executor.execute(sql, vals);
+
+            try {
+                // fetch generated ID
+                String keySql = String.format("SELECT MAX(%s) FROM %s", idCol, table);
+                Long generated = executor.queryForLong(keySql);
+                if (generated != null) {
+                    Field idField = md.getIdField();
+                    idField.setAccessible(true);
+                    idField.set(entity, generated);
+                }
+            } catch (Exception e) {
+                throw new OrmException("Failed to set auto-generated ID", e);
+            }
         } else {
-            // Include ID column explicitly when not auto-increment
-            cols = new ArrayList<>();
-            cols.add(md.getIdColumn());
-            cols.addAll(md.getColumns());
+            // include ID explicitly
+            List<String> allCols = new ArrayList<>();
+            allCols.add(idCol);
+            allCols.addAll(cols);
 
-            values = new ArrayList<>();
-            values.add(md.idValue(entity));
-            values.addAll(md.values(entity));
+            List<Object> allVals = new ArrayList<>();
+            allVals.add(md.idValue(entity));
+            allVals.addAll(vals);
+
+            String columnList = String.join(", ", allCols);
+            String paramList  = allCols.stream().map(c -> "?").collect(Collectors.joining(", "));
+            String sql = String.format("INSERT INTO %s (%s) VALUES (%s)", table, columnList, paramList);
+
+            executor.execute(sql, allVals);
         }
-
-        String columns = String.join(", ", cols);
-        String params = cols.stream()
-                .map(c -> "?")
-                .collect(Collectors.joining(", "));
-
-        String sql = String.format(
-                "INSERT INTO %s (%s) VALUES (%s)",
-                md.getTableName(),
-                columns,
-                params
-        );
-
-        executor.execute(sql, values);
     }
+
 
     public <T> void delete(T entity, EntityMetadata md) {
         String sql = String.format(
