@@ -3,127 +3,201 @@ package de.t14d3.spool.mapping;
 import de.t14d3.spool.annotations.Column;
 import de.t14d3.spool.annotations.Entity;
 import de.t14d3.spool.annotations.Id;
+import de.t14d3.spool.annotations.OneToMany;
 import de.t14d3.spool.annotations.Table;
-import de.t14d3.spool.exceptions.OrmException;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Holds metadata information about an entity class using reflection.
+ */
 public class EntityMetadata {
-    private static final Map<Class<?>, EntityMetadata> CACHE = new ConcurrentHashMap<>();
+    private static final Map<Class<?>, EntityMetadata> METADATA_CACHE = new ConcurrentHashMap<>();
 
+    private final Class<?> entityClass;
     private final String tableName;
-    private final String idColumn;
     private final Field idField;
-    private final String idType; // Add field to store ID type
-    private boolean autoIncrement; // New field to store auto-increment flag
-    private final List<String> columns;
-    private final List<String> columnTypes;
+    private final boolean autoIncrement;
     private final List<Field> fields;
+    private final Map<String, Field> columnToField;
+    private final Map<Field, String> fieldToColumn;
 
-    private EntityMetadata(Class<?> cls) {
-        if (!cls.isAnnotationPresent(Entity.class)) {
-            throw new OrmException("Class not marked @Entity: " + cls);
+    private EntityMetadata(Class<?> entityClass) {
+        this.entityClass = entityClass;
+        
+        // Validate entity annotation
+        if (!entityClass.isAnnotationPresent(Entity.class)) {
+            throw new IllegalArgumentException("Class " + entityClass.getName() + " is not annotated with @Entity");
         }
 
-        Table tbl = cls.getAnnotation(Table.class);
-        this.tableName = (tbl != null) ? tbl.name() : cls.getSimpleName().toLowerCase();
+        // Extract table name
+        Table tableAnnotation = entityClass.getAnnotation(Table.class);
+        this.tableName = (tableAnnotation != null) ? tableAnnotation.name() : entityClass.getSimpleName().toLowerCase();
 
-        Field idFieldTemp = null;
-        String idColumnTemp = null;
-        String idTypeTemp = null;
-        List<String> cols = new ArrayList<>();
-        List<String> types = new ArrayList<>();
-        List<Field> flds = new ArrayList<>();
+        // Scan fields
+        this.fields = new ArrayList<>();
+        this.columnToField = new HashMap<>();
+        this.fieldToColumn = new HashMap<>();
+        Field foundIdField = null;
+        boolean foundAutoIncrement = false;
 
-        for (Field f : cls.getDeclaredFields()) {
-            f.setAccessible(true);
-            if (f.isAnnotationPresent(Id.class)) {
-                if (idFieldTemp != null) {
-                    throw new OrmException("Multiple @Id fields in class: " + cls);
+        for (Field field : entityClass.getDeclaredFields()) {
+            field.setAccessible(true);
+
+            if (field.isAnnotationPresent(Id.class)) {
+                foundIdField = field;
+                Id idAnnotation = field.getAnnotation(Id.class);
+                foundAutoIncrement = idAnnotation.autoIncrement();
+                
+                // Add ID field to fields list - it has a column
+                if (field.isAnnotationPresent(Column.class)) {
+                    Column column = field.getAnnotation(Column.class);
+                    String columnName = column.name();
+                    fields.add(field);
+                    columnToField.put(columnName, field);
+                    fieldToColumn.put(field, columnName);
+                } else {
+                    // Use field name as column name for ID
+                    String columnName = field.getName();
+                    fields.add(field);
+                    columnToField.put(columnName, field);
+                    fieldToColumn.put(field, columnName);
                 }
-                idFieldTemp = f;
-                Id idAnnotation = f.getAnnotation(Id.class);
-                idTypeTemp = idAnnotation.type();
-                this.autoIncrement = idAnnotation.autoIncrement(); // Check for auto-increment
-                Column col = f.getAnnotation(Column.class);
-                idColumnTemp = (col != null && !col.name().isEmpty()) ? col.name() : f.getName();
-            } else if (f.isAnnotationPresent(Column.class)) {
-                Column col = f.getAnnotation(Column.class);
-                cols.add(!col.name().isEmpty() ? col.name() : f.getName());
-                types.add(!col.type().isEmpty() ? col.type() : "VARCHAR(255)"); // Default type
-                flds.add(f);
+            }
+
+            // Handle column-mapped fields (regular columns and foreign keys)
+            if (field.isAnnotationPresent(Column.class) && !field.isAnnotationPresent(Id.class)) {
+                fields.add(field);
+                Column column = field.getAnnotation(Column.class);
+                String columnName = column.name();
+                columnToField.put(columnName, field);
+                fieldToColumn.put(field, columnName);
+            } else if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
+                // Treat @ManyToOne fields as foreign key columns
+                fields.add(field);
+                // Convention: {fieldName}_id
+                String columnName = field.getName() + "_id";
+                columnToField.put(columnName, field);
+                fieldToColumn.put(field, columnName);
+            } else if (field.isAnnotationPresent(OneToMany.class)) {
+                // @OneToMany fields don't have direct database columns but are part of relationships
+                // We don't add them to the fields list as they're not direct columns
+                // but we should track them for relationship management
             }
         }
 
-        if (idFieldTemp == null) {
-            throw new OrmException("No @Id field in class: " + cls);
+        if (foundIdField == null) {
+            throw new IllegalArgumentException("Entity " + entityClass.getName() + " must have a field annotated with @Id");
         }
 
-        this.idField = idFieldTemp;
-        this.idColumn = idColumnTemp;
-        this.idType = idTypeTemp; // Store the ID type
-        this.columns = Collections.unmodifiableList(cols);
-        this.columnTypes = Collections.unmodifiableList(types);
-        this.fields = Collections.unmodifiableList(flds);
+        this.idField = foundIdField;
+        this.autoIncrement = foundAutoIncrement;
     }
 
-    public static Set<Class<?>> loadedClasses() {
-        return Collections.unmodifiableSet(CACHE.keySet());
+    /**
+     * Get or create metadata for the given entity class.
+     */
+    public static EntityMetadata of(Class<?> entityClass) {
+        return METADATA_CACHE.computeIfAbsent(entityClass, EntityMetadata::new);
     }
 
-    public static EntityMetadata of(Class<?> cls) {
-        return CACHE.computeIfAbsent(cls, EntityMetadata::new);
+    public Class<?> getEntityClass() {
+        return entityClass;
     }
 
     public String getTableName() {
         return tableName;
     }
 
-    public boolean isAutoIncrement() { return autoIncrement; }
-
-    public String getIdColumn() {
-        return idColumn;
-    }
-
     public Field getIdField() {
         return idField;
     }
 
-    public String getIdType() {
-        return idType;
+    public String getIdColumnName() {
+        return fieldToColumn.get(idField);
     }
 
-    public List<String> getColumns() {
-        return columns;
-    }
-
-    public List<String> getColumnTypes() {
-        return columnTypes;
+    public boolean isAutoIncrement() {
+        return autoIncrement;
     }
 
     public List<Field> getFields() {
-        return fields;
+        return Collections.unmodifiableList(fields);
     }
 
-    public Object idValue(Object entity) {
+    public String getColumnName(Field field) {
+        return fieldToColumn.get(field);
+    }
+
+    public Field getField(String columnName) {
+        return columnToField.get(columnName);
+    }
+
+    /**
+     * Gets the ID value from an entity instance.
+     */
+    public Object getIdValue(Object entity) {
         try {
             return idField.get(entity);
-        } catch (Exception e) {
-            throw new OrmException(e);
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException("Cannot access ID field", e);
         }
     }
 
-    public List<Object> values(Object entity) {
-        List<Object> vals = new ArrayList<>();
-        for (Field f : fields) {
-            try {
-                vals.add(f.get(entity));
-            } catch (Exception e) {
-                throw new OrmException(e);
+    /**
+     * Sets the ID value on an entity instance.
+     */
+    public void setIdValue(Object entity, Object value) {
+        try {
+            idField.set(entity, value);
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException("Cannot set ID field", e);
+        }
+    }
+
+    /**
+     * Gets the value of a field from an entity instance.
+     */
+    public Object getFieldValue(Object entity, Field field) {
+        try {
+            return field.get(entity);
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException("Cannot access field " + field.getName(), e);
+        }
+    }
+
+    /**
+     * Sets the value of a field on an entity instance.
+     */
+    public void setFieldValue(Object entity, Field field, Object value) {
+        try {
+            field.set(entity, value);
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException("Cannot set field " + field.getName(), e);
+        }
+    }
+
+    /**
+     * Creates a new instance of the entity.
+     */
+    public Object newInstance() {
+        // Try to find parameterless constructor
+        Constructor<?> constructor = null;
+        for (Constructor<?> c : entityClass.getDeclaredConstructors()) {
+            if (c.getParameterCount() == 0) {
+                constructor = c;
+                break;
             }
         }
-        return vals;
+
+        if (constructor == null) {
+            throw new RuntimeException("Cannot find parameterless constructor for entity " + entityClass.getName());
+        }
+
+        try { return constructor.newInstance(); }
+        catch (Exception e) { throw new RuntimeException("Cannot instantiate entity " + entityClass.getName(), e); }
     }
 }

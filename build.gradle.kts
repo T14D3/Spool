@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "de.t14d3"
-version = "1.0-SNAPSHOT"
+version = "1.1-SNAPSHOT"
 
 application {
     mainClass.set("de.t14d3.spool.Main")

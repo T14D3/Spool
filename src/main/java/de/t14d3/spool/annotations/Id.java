@@ -1,10 +1,18 @@
 package de.t14d3.spool.annotations;
 
-import java.lang.annotation.*;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
 
-@Retention(RetentionPolicy.RUNTIME)
+/**
+ * Marks a field as the primary key identifier.
+ */
 @Target(ElementType.FIELD)
+@Retention(RetentionPolicy.RUNTIME)
 public @interface Id {
-    String type() default "BIGINT";
-    boolean autoIncrement() default false; // New property for auto-increment
+    /**
+     * Whether the ID should be auto-incremented by the database.
+     */
+    boolean autoIncrement() default false;
 }

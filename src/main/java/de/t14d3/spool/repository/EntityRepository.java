@@ -1,161 +1,143 @@
 package de.t14d3.spool.repository;
 
-import de.t14d3.spool.annotations.Repository;
 import de.t14d3.spool.core.EntityManager;
-import de.t14d3.spool.core.Persister;
 import de.t14d3.spool.mapping.EntityMetadata;
-import org.reflections.Reflections;
-import org.reflections.scanners.Scanners;
-import org.reflections.util.ClasspathHelper;
-import org.reflections.util.ConfigurationBuilder;
 
-import java.net.URL;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
+import java.util.List;
 
 /**
- * Base repository that auto-generates table schema on initialization.
+ * Base repository class for entity CRUD operations.
+ * 
+ * Provides a convenient base class for entity-specific repositories, implementing
+ * common CRUD (Create, Read, Update, Delete) operations. The repository pattern
+ * abstracts database access logic and provides a cleaner separation of concerns
+ * between business logic and data access.
+ * 
+ * @param <T> The entity type managed by this repository
+ * 
+ * @see EntityManager
+ * @see EntityMetadata
  */
-public abstract class EntityRepository<T> {
-    private static final Map<Class<?>, EntityRepository<?>> REPOSITORY_REGISTRY = new ConcurrentHashMap<>();
-    private static final Set<Class<?>> CREATING_REPOSITORIES = ConcurrentHashMap.newKeySet();
+public class EntityRepository<T> {
+    protected final EntityManager entityManager;
+    protected final Class<T> entityClass;
+    protected final EntityMetadata metadata;
 
-    protected final EntityManager em;
-    protected final Persister persister;
-    protected final Class<T> clazz;
-    protected final EntityMetadata md;
-
-    protected EntityRepository(EntityManager em, Class<T> clazz) {
-        this.em = em;
-        this.clazz = clazz;
-        this.md = EntityMetadata.of(clazz);
-        this.persister = new Persister(em.getExecutor());
-        ensureSchema();
-    }
-
-    // Creates table based on entity metadata
-    protected void ensureSchema() {
-        String idCol = md.getIdColumn();
-        String idType = md.getIdType();
-        String table = md.getTableName();
-
-        // Build ID column definition, include AUTO_INCREMENT in correct position for H2
-        String idDef = idCol + " " + idType
-                + (md.isAutoIncrement() ? " AUTO_INCREMENT" : "")
-                + " PRIMARY KEY";
-
-        // Build other columns definitions
-        List<String> columns = md.getColumns();
-        List<String> columnTypes = md.getColumnTypes();
-        String otherDefs = "";
-        if (!columns.isEmpty()) {
-            List<String> defs = new ArrayList<>();
-            for (int i = 0; i < columns.size(); i++) {
-                defs.add(columns.get(i) + " " + columnTypes.get(i));
-            }
-            otherDefs = ", " + String.join(", ", defs);
-        }
-
-        String ddl = String.format(
-                "CREATE TABLE IF NOT EXISTS %s (%s%s)",
-                table,
-                idDef,
-                otherDefs
-        );
-        em.getExecutor().execute(ddl, List.of());
+    /**
+     * Creates a new repository for the specified entity class.
+     * 
+     * @param entityManager the EntityManager to use for database operations
+     * @param entityClass the class of entities managed by this repository
+     */
+    public EntityRepository(EntityManager entityManager, Class<T> entityClass) {
+        this.entityManager = entityManager;
+        this.entityClass = entityClass;
+        this.metadata = EntityMetadata.of(entityClass);
     }
 
     /**
-     * Gets or creates a repository instance for the given entity class.
-     *
-     * @param <T> Entity type
-     * @param em EntityManager instance
-     * @param entityClass Entity class
-     * @return Existing or new repository instance
-     * @throws IllegalStateException if repository can't be created
+     * Save an entity (insert or update).
+     * <p>
+     * If the entity has no ID or doesn't exist in the database, it will be inserted.
+     * Otherwise, it will be updated. The entity is marked for persistence and will
+     * be synchronized with the database when flush() is called.
+     * 
+     * @param entity the entity to save
+     * @return the same entity instance
      */
-    @SuppressWarnings("unchecked")
-    public static <T> EntityRepository<T> getRepository(EntityManager em, Class<T> entityClass) {
-        EntityRepository<?> repo = REPOSITORY_REGISTRY.get(entityClass);
-        if (repo != null) {
-            return (EntityRepository<T>) repo;
-        }
-
-        // Prevent recursive creation attempts
-        if (CREATING_REPOSITORIES.contains(entityClass)) {
-            throw new IllegalStateException("Circular dependency detected while creating repository for " + entityClass.getName());
-        }
-
-        try {
-            CREATING_REPOSITORIES.add(entityClass);
-            return (EntityRepository<T>) REPOSITORY_REGISTRY.computeIfAbsent(
-                    entityClass,
-                    cls -> createRepository(em, entityClass)
-            );
-        } finally {
-            CREATING_REPOSITORIES.remove(entityClass);
-        }
+    public T save(T entity) {
+        entityManager.persist(entity);
+        return entity;
     }
 
-    @SuppressWarnings("unchecked")
-    private static <T> EntityRepository<T> createRepository(EntityManager em, Class<T> entityClass) {
-        String entityPkg = entityClass.getPackageName();
-        String repoPkg = entityPkg + ".repository";
-        Set<URL> urls = new HashSet<>();
-        urls.addAll(ClasspathHelper.forPackage(repoPkg));
-        urls.addAll(ClasspathHelper.forPackage(entityPkg));
-
-        Reflections reflections = new Reflections(
-                new ConfigurationBuilder()
-                        .setUrls(urls)
-                        .setScanners(Scanners.TypesAnnotated)
-        );
-
-        for (Class<?> repoCls : reflections.getTypesAnnotatedWith(Repository.class)) {
-            Repository ann = repoCls.getAnnotation(Repository.class);
-            if (ann.value().equals(entityClass)) {
-                try {
-                    return (EntityRepository<T>) repoCls
-                            .getDeclaredConstructor(EntityManager.class, Class.class)
-                            .newInstance(em, entityClass);
-                } catch (ReflectiveOperationException e) {
-                    throw new IllegalStateException("Cannot instantiate " + repoCls, e);
-                }
-            }
-        }
-
-        throw new IllegalStateException(
-                "No @Repository(" + entityClass.getName() + ") found in packages: "
-                        + entityPkg + " or " + repoPkg
-        );
-    }
-
+    /**
+     * Find an entity by its ID.
+     * 
+     * @param id the ID of the entity
+     * @return the entity instance if found, null otherwise
+     */
     public T findById(Object id) {
-        return em.find(clazz, id);
+        return entityManager.find(entityClass, id);
     }
 
-    public List<T> findBy(Map<String, Object> criteria) {
-        return em.getExecutor().findBy(clazz, criteria);
-    }
-
-    public List<T> findBy(Map<String, Object> criteria, String orderBy, int limit, int offset) {
-        return em.getExecutor().findBy(clazz, criteria, orderBy, limit, offset);
-    }
-
-    public T findOneBy(Map<String, Object> criteria) {
-        return em.getExecutor().findOneBy(clazz, criteria);
-    }
-
+    /**
+     * Find all entities of this type.
+     * 
+     * @return a list containing all entities of this type
+     */
     public List<T> findAll() {
-        return em.getExecutor().findAll(clazz);
+        return entityManager.getExecutor().findAll(entityClass);
     }
 
-    public void save(T entity) {
-        em.persist(entity);
-    }
-
+    /**
+     * Delete an entity.
+     * 
+     * Marks the entity for deletion. The deletion will be performed when flush() is called.
+     * 
+     * @param entity the entity to delete
+     */
     public void delete(T entity) {
-        em.remove(entity);
+        entityManager.remove(entity);
+    }
+
+    /**
+     * Delete an entity by its ID.
+     * 
+     * First retrieves the entity by ID, then marks it for deletion. If no entity
+     * with the given ID exists, this method does nothing.
+     * 
+     * @param id the ID of the entity to delete
+     */
+    public void deleteById(Object id) {
+        T entity = findById(id);
+        if (entity != null) {
+            delete(entity);
+        }
+    }
+
+    /**
+     * Check if an entity exists by ID.
+     * 
+     * @param id the ID to check
+     * @return true if an entity with the given ID exists, false otherwise
+     */
+    public boolean existsById(Object id) {
+        return findById(id) != null;
+    }
+
+    /**
+     * Count all entities of this type.
+     * 
+     * @return the total number of entities
+     */
+    public long count() {
+        return findAll().size();
+    }
+
+    /**
+     * Get the EntityManager instance.
+     * 
+     * @return the EntityManager instance
+     */
+    protected EntityManager getEntityManager() {
+        return entityManager;
+    }
+
+    /**
+     * Get the entity class.
+     * 
+     * @return the entity class managed by this repository
+     */
+    protected Class<T> getEntityClass() {
+        return entityClass;
+    }
+
+    /**
+     * Get the entity metadata.
+     * 
+     * @return the metadata for the entity class
+     */
+    protected EntityMetadata getMetadata() {
+        return metadata;
     }
 }

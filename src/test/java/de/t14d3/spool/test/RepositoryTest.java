@@ -9,21 +9,33 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-class UserRepository extends EntityRepository<User> {
-    public UserRepository(EntityManager em) {
-        super(em, User.class);
-    }
-}
-
+/**
+ * Test for repository pattern functionality.
+ */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 public class RepositoryTest {
     private EntityManager em;
-    private UserRepository repo;
+    private EntityRepository<User> userRepo;
 
     @BeforeEach
     void setup() {
-        em = EntityManager.create("jdbc:h2:mem:test2;DB_CLOSE_DELAY=-1");
-        repo = new UserRepository(em);
+        em = EntityManager.create("jdbc:h2:mem:repo_test;DB_CLOSE_DELAY=-1");
+        userRepo = new EntityRepository<>(em, User.class);
+
+        // Drop and recreate tables to ensure clean state
+        try {
+            em.getExecutor().execute("DROP TABLE IF EXISTS users", List.of());
+        } catch (Exception e) {
+            // Ignore - table might not exist
+        }
+
+        em.getExecutor().execute(
+                "CREATE TABLE users (" +
+                        "id BIGINT AUTO_INCREMENT PRIMARY KEY, " +
+                        "username VARCHAR(50), " +
+                        "email VARCHAR(50)" +
+                        ")", List.of()
+        );
     }
 
     @AfterEach
@@ -33,75 +45,88 @@ public class RepositoryTest {
 
     @Test
     void testSaveAndFindById() {
-        User u = new User(10L, "eve", "eve@example.com");
-        repo.save(u);
+        // Create and save a user
+        User user = new User("john_doe", "john@example.com");
+        assertNull(user.getId());
+        
+        userRepo.save(user);
         em.flush();
-
-        User found = repo.findById(u.getId());
-        assertNotNull(found);
-        assertEquals("eve", found.getUsername());
-    }
-
-    @Test
-    void testFindAll() {
-        User u1 = new User(null, "frank", "frank@example.com");
-        User u2 = new User(null, "grace", "grace@example.com");
-        repo.save(u1);
-        repo.save(u2);
-        em.flush();
-
-        List<User> list = repo.findAll();
-        assertTrue(list.stream().anyMatch(u -> u.getId().equals(u1.getId())));
-        assertTrue(list.stream().anyMatch(u -> u.getId().equals(u2.getId())));
+        
+        assertNotNull(user.getId());
+        
+        // Find by ID
+        User foundUser = userRepo.findById(user.getId());
+        assertNotNull(foundUser);
+        assertEquals("john_doe", foundUser.getUsername());
+        assertEquals("john@example.com", foundUser.getEmail());
     }
 
     @Test
     void testUpdateEntity() {
-        User u = new User(5L, "erin", "erin@old.com");
-        em.persist(u);
+        // Create and save a user
+        User user = new User("jane_doe", "jane@example.com");
+        userRepo.save(user);
         em.flush();
-
-        User loaded = em.find(User.class, 5L);
-        assertEquals("erin@old.com", loaded.getEmail());
-        loaded.setEmail("erin@new.com");
-        // flag for update
-        em.persist(loaded);
+        
+        // Update the user
+        user.setEmail("jane.updated@example.com");
+        userRepo.save(user);
         em.flush();
-
-        User updated = em.find(User.class, 5L);
-        assertNotNull(updated);
-        assertEquals("erin@new.com", updated.getEmail());
+        
+        // Verify update
+        User updatedUser = userRepo.findById(user.getId());
+        assertNotNull(updatedUser);
+        assertEquals("jane.updated@example.com", updatedUser.getEmail());
     }
 
     @Test
     void testDelete() {
-        User u = new User(13L, "heidi", "heidi@example.com");
-        repo.save(u);
+        // Create and save a user
+        User user = new User("delete_me", "delete@example.com");
+        userRepo.save(user);
         em.flush();
-
-        User found = repo.findById(13L);
-        assertNotNull(found);
-
-        repo.delete(found);
+        
+        Long userId = user.getId();
+        
+        // Delete the user
+        userRepo.delete(user);
         em.flush();
-
-        assertNull(repo.findById(13L));
+        
+        // Verify deletion
+        User deletedUser = userRepo.findById(userId);
+        assertNull(deletedUser);
     }
 
     @Test
     void testUpdateViaRepository() {
-        User u = new User(20L, "ivan", "ivan@old.com");
-        repo.save(u);
+        // Create and save multiple users
+        User user1 = new User("user1", "user1@example.com");
+        User user2 = new User("user2", "user2@example.com");
+        User user3 = new User("user3", "user3@example.com");
+        
+        userRepo.save(user1);
+        userRepo.save(user2);
+        userRepo.save(user3);
         em.flush();
-
-        User loaded = repo.findById(20L);
-        assertEquals("ivan@old.com", loaded.getEmail());
-        loaded.setEmail("ivan@new.com");
-        repo.save(loaded);
+        
+        // Test count
+        assertEquals(3, userRepo.count());
+        
+        // Test findAll
+        List<User> allUsers = userRepo.findAll();
+        assertEquals(3, allUsers.size());
+        
+        // Test existsById
+        assertTrue(userRepo.existsById(user1.getId()));
+        assertTrue(userRepo.existsById(user2.getId()));
+        assertTrue(userRepo.existsById(user3.getId()));
+        assertFalse(userRepo.existsById(999L));
+        
+        // Test deleteById
+        userRepo.deleteById(user3.getId());
         em.flush();
-
-        User updated = repo.findById(20L);
-        assertNotNull(updated);
-        assertEquals("ivan@new.com", updated.getEmail());
+        
+        assertEquals(2, userRepo.count());
+        assertFalse(userRepo.existsById(user3.getId()));
     }
 }

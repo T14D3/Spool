@@ -5,6 +5,7 @@ import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.test.entities.User;
 import org.junit.jupiter.api.*;
 
+import java.sql.SQLException;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -22,13 +23,14 @@ public class EntityManagerTest {
     }
 
     @BeforeEach
-    void setup() {
+    void setup() throws SQLException {
         em = EntityManager.create("jdbc:h2:mem:test;DB_CLOSE_DELAY=-1");
         // Ensure table is created
         EntityMetadata.of(User.class);
         em.getExecutor().execute(
-                "CREATE TABLE users (id BIGINT PRIMARY KEY, username VARCHAR(50), email VARCHAR(50))", List.of()
+                "CREATE TABLE users (id BIGINT AUTO_INCREMENT PRIMARY KEY, username VARCHAR(50), email VARCHAR(50))", List.of()
         );
+
     }
 
     @AfterEach
