@@ -1,5 +1,7 @@
 package de.t14d3.spool.migration;
 
+import de.t14d3.spool.query.Dialect;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -9,19 +11,7 @@ import java.util.List;
  */
 public class SqlGenerator {
 
-    public enum Dialect {
-        GENERIC,
-        MYSQL,
-        POSTGRESQL,
-        SQLITE,
-        H2
-    }
-
     private final Dialect dialect;
-
-    public SqlGenerator() {
-        this(Dialect.GENERIC);
-    }
 
     public SqlGenerator(Dialect dialect) {
         this.dialect = dialect;
@@ -235,18 +225,4 @@ public class SqlGenerator {
         }
     }
 
-    /**
-     * Detect dialect from JDBC URL.
-     */
-    public static Dialect detectDialect(String jdbcUrl) {
-        if (jdbcUrl == null) return Dialect.GENERIC;
-
-        jdbcUrl = jdbcUrl.toLowerCase();
-        if (jdbcUrl.contains("mysql")) return Dialect.MYSQL;
-        if (jdbcUrl.contains("postgresql") || jdbcUrl.contains("postgres")) return Dialect.POSTGRESQL;
-        if (jdbcUrl.contains("sqlite")) return Dialect.SQLITE;
-        if (jdbcUrl.contains("h2")) return Dialect.H2;
-
-        return Dialect.GENERIC;
-    }
 }

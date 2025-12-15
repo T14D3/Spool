@@ -2,6 +2,7 @@ package de.t14d3.spool.test;
 
 import de.t14d3.spool.core.EntityManager;
 import de.t14d3.spool.migration.*;
+import de.t14d3.spool.query.Dialect;
 import de.t14d3.spool.test.entities.User;
 import de.t14d3.spool.test.entities.Author;
 import de.t14d3.spool.test.entities.Book;
@@ -281,16 +282,16 @@ public class MigrationTest {
         System.out.println("=== Testing SQL Generator Dialects ===");
         
         // Test dialect detection
-        assertEquals(SqlGenerator.Dialect.H2, SqlGenerator.detectDialect("jdbc:h2:mem:test"));
+        assertEquals(Dialect.H2, Dialect.detectFromUrl("jdbc:h2:mem:test"));
         System.out.println("✓ H2 dialect detected");
         
-        assertEquals(SqlGenerator.Dialect.MYSQL, SqlGenerator.detectDialect("jdbc:mysql://localhost/db"));
+        assertEquals(Dialect.MYSQL, Dialect.detectFromUrl("jdbc:mysql://localhost/db"));
         System.out.println("✓ MySQL dialect detected");
         
-        assertEquals(SqlGenerator.Dialect.POSTGRESQL, SqlGenerator.detectDialect("jdbc:postgresql://localhost/db"));
+        assertEquals(Dialect.POSTGRESQL, Dialect.detectFromUrl("jdbc:postgresql://localhost/db"));
         System.out.println("✓ PostgreSQL dialect detected");
         
-        assertEquals(SqlGenerator.Dialect.SQLITE, SqlGenerator.detectDialect("jdbc:sqlite:test.db"));
+        assertEquals(Dialect.SQLITE, Dialect.detectFromUrl("jdbc:sqlite:test.db"));
         System.out.println("✓ SQLite dialect detected");
     }
 

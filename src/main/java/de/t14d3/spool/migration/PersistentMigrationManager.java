@@ -1,5 +1,7 @@
 package de.t14d3.spool.migration;
 
+import de.t14d3.spool.query.Dialect;
+
 import java.io.*;
 import java.nio.file.*;
 import java.sql.*;
@@ -331,12 +333,12 @@ public class PersistentMigrationManager {
     /**
      * Detect the SQL dialect from the connection.
      */
-    private SqlGenerator.Dialect detectDialect() {
+    private Dialect detectDialect() {
         try {
             String url = connection.getMetaData().getURL();
-            return SqlGenerator.detectDialect(url);
+            return Dialect.detectFromUrl(url);
         } catch (SQLException e) {
-            return SqlGenerator.Dialect.GENERIC;
+            return Dialect.GENERIC;
         }
     }
 

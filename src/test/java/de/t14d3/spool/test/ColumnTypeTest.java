@@ -17,8 +17,7 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Tests for explicit column type specification in @Column annotation.
@@ -81,6 +80,42 @@ public class ColumnTypeTest {
         System.out.println("✓ Explicit column types work correctly");
         System.out.println("✓ Default type inference still works for columns without type() specification");
     }
+
+    @Test
+    void testNumericColumnType() throws SQLException {
+        System.out.println("=== Testing Numeric Column Type ===");
+
+        // Register the test entity with explicit column type
+        em.registerEntities(TestEntity.class);
+
+        // Create schema from entity metadata
+        SchemaIntrospector introspector = em.getMigrationManager().getIntrospector();
+        TableDefinition tableDef = introspector.buildTableDefinitionFromEntity(TestEntity.class);
+
+        // Check that the weight column uses REAL type
+        assertTrue(tableDef.hasColumn("weight"), "Should have weight column");
+        ColumnDefinition weightColumn = tableDef.getColumns().get("weight");
+        assertEquals("FLOAT", weightColumn.getSqlType(), "Weight column should use FLOAT type");
+
+        // Ensure schema
+        em.updateSchema();
+
+        TestEntity entity = new TestEntity();
+        entity.setWeight(1.23F);
+        entity.setId(1L);
+        entity.setName("Test");
+        entity.setDescription("Test description");
+        entity.setNotes("Test notes");
+        entity.setAge(42);
+        em.persist(entity);
+        em.flush();
+
+        TestEntity found = em.find(TestEntity.class, 1L);
+        assertNotNull(found);
+        assertEquals(1.23f, found.getWeight());
+
+        System.out.println("✓ Numeric column types work correctly");
+    }
 }
 
 @Entity
@@ -102,6 +137,9 @@ class TestEntity {
     @Column(name = "age")
     private Integer age;
 
+    @Column(name = "weight")
+    private float weight;
+
     // Constructor, getters, setters omitted for brevity
     public TestEntity() {}
 
@@ -119,4 +157,12 @@ class TestEntity {
 
     public Integer getAge() { return age; }
     public void setAge(Integer age) { this.age = age; }
+
+    public void setWeight(float v) {
+        this.weight = v;
+    }
+
+    public float getWeight() {
+        return weight;
+    }
 }

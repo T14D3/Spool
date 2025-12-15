@@ -184,7 +184,7 @@ public class SqlExecutor {
         if (metadata.isAutoIncrement() && metadata.getIdValue(entity) == null) {
             Object generated = executeInsert(q.getSql(), q.getParameters());
             if (generated != null) {
-                Object converted = convertToFieldType(generated, metadata.getIdField().getType());
+                Object converted = de.t14d3.spool.mapping.TypeMapper.convertToJavaType(generated, metadata.getIdField().getType());
                 metadata.setIdValue(entity, converted);
             }
         } else {
@@ -239,7 +239,7 @@ public class SqlExecutor {
             }
 
             if (raw != null) {
-                raw = convertToFieldType(raw, field.getType());
+                raw = de.t14d3.spool.mapping.TypeMapper.convertToJavaType(raw, field.getType());
             }
 
             // For ManyToOne we currently do not eagerly load related entity;
@@ -255,43 +255,6 @@ public class SqlExecutor {
         }
 
         return (T) entity;
-    }
-
-    /**
-     * Convert DB column value to a Java field type where needed.
-     */
-    public static Object convertToFieldType(Object value, Class<?> targetType) {
-        if (value == null) return null;
-
-        if (targetType == Long.class || targetType == long.class) {
-            if (value instanceof Number) return ((Number) value).longValue();
-        } else if (targetType == Integer.class || targetType == int.class) {
-            if (value instanceof Number) return ((Number) value).intValue();
-        } else if (targetType == String.class) {
-            return value.toString();
-        } else if (targetType == Boolean.class || targetType == boolean.class) {
-            if (value instanceof Boolean) return value;
-            if (value instanceof Number) return ((Number) value).intValue() != 0;
-            return Boolean.parseBoolean(value.toString());
-        } else if (targetType == Date.class) {
-            if (value instanceof Timestamp) {
-                return new Date(((Timestamp) value).getTime());
-            } else if (value instanceof java.sql.Date) {
-                return new Date(((java.sql.Date) value).getTime());
-            }
-        } else if (targetType == LocalDate.class) {
-            if (value instanceof java.sql.Date) {
-                return ((java.sql.Date) value).toLocalDate();
-            } else if (value instanceof Timestamp) {
-                return ((Timestamp) value).toInstant().atZone(ZoneId.systemDefault()).toLocalDate();
-            }
-        } else if (targetType == LocalDateTime.class) {
-            if (value instanceof Timestamp) {
-                return ((Timestamp) value).toLocalDateTime();
-            }
-        }
-
-        return value;
     }
 
     // ---------------------------------------------------------------------

@@ -4,6 +4,7 @@ import de.t14d3.spool.annotations.Column;
 import de.t14d3.spool.annotations.Id;
 import de.t14d3.spool.annotations.ManyToOne;
 import de.t14d3.spool.mapping.EntityMetadata;
+import de.t14d3.spool.mapping.TypeMapper;
 import de.t14d3.spool.query.Dialect;
 
 import java.lang.reflect.Field;
@@ -361,7 +362,7 @@ public class SchemaIntrospector {
             boolean isAutoIncrement = isPrimaryKey && metadata.isAutoIncrement();
 
             // Determine SQL type from Java type
-            String sqlType = javaTypeToSqlType(field.getType());
+            String sqlType = TypeMapper.javaTypeToSqlType(field.getType());
             Integer length = null;
             boolean nullable = true;
 
@@ -412,40 +413,6 @@ public class SchemaIntrospector {
     // Type mapping helpers
     // -----------------------
 
-    private String javaTypeToSqlType(Class<?> javaType) {
-        if (javaType == String.class) {
-            return "VARCHAR";
-        } else if (javaType == Long.class || javaType == long.class) {
-            return "BIGINT";
-        } else if (javaType == Integer.class || javaType == int.class) {
-            return "INTEGER";
-        } else if (javaType == Short.class || javaType == short.class) {
-            return "SMALLINT";
-        } else if (javaType == Byte.class || javaType == byte.class) {
-            return "TINYINT";
-        } else if (javaType == Double.class || javaType == double.class) {
-            return "DOUBLE";
-        } else if (javaType == Float.class || javaType == float.class) {
-            return "FLOAT";
-        } else if (javaType == Boolean.class || javaType == boolean.class) {
-            return "BOOLEAN";
-        } else if (javaType == java.util.Date.class || javaType == java.sql.Date.class) {
-            return "DATE";
-        } else if (javaType == java.sql.Timestamp.class) {
-            return "TIMESTAMP";
-        } else if (javaType == java.time.LocalDate.class) {
-            return "DATE";
-        } else if (javaType == java.time.LocalDateTime.class) {
-            return "TIMESTAMP";
-        } else if (javaType == byte[].class) {
-            return "BLOB";
-        } else if (javaType == java.math.BigDecimal.class) {
-            return "DECIMAL";
-        } else {
-            // For entity types (relationships), use BIGINT for foreign keys
-            return "BIGINT";
-        }
-    }
 
     private int parseLengthFromType(String type) {
         if (type == null) return -1;
