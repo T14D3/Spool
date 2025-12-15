@@ -13,9 +13,14 @@ public class ColumnDefinition {
     private final boolean autoIncrement;
     private final String defaultValue;
     private final Integer length;
+    private final String referencedTable;
+    private final String referencedColumn;
+    private final boolean foreignKey;
+
 
     public ColumnDefinition(String name, String sqlType, boolean nullable, boolean primaryKey,
-                            boolean autoIncrement, String defaultValue, Integer length) {
+                            boolean autoIncrement, String defaultValue, Integer length,
+                            String referencedTable, String referencedColumn) {
         this.name = name;
         this.sqlType = sqlType;
         this.nullable = nullable;
@@ -23,7 +28,11 @@ public class ColumnDefinition {
         this.autoIncrement = autoIncrement;
         this.defaultValue = defaultValue;
         this.length = length;
+        this.referencedTable = referencedTable;
+        this.referencedColumn = referencedColumn;
+        this.foreignKey = referencedTable != null && referencedColumn != null;
     }
+
 
     public String getName() {
         return name;
@@ -53,6 +62,18 @@ public class ColumnDefinition {
         return length;
     }
 
+    public String getReferencedTable() {
+        return referencedTable;
+    }
+
+    public String getReferencedColumn() {
+        return referencedColumn;
+    }
+
+    public boolean isForeignKey() {
+        return foreignKey;
+    }
+
     /**
      * Get the full SQL type including length if applicable.
      */
@@ -62,6 +83,7 @@ public class ColumnDefinition {
         }
         return sqlType;
     }
+
 
     @Override
     public boolean equals(Object o) {
@@ -104,6 +126,8 @@ public class ColumnDefinition {
         private boolean autoIncrement = false;
         private String defaultValue = null;
         private Integer length = null;
+        private String referencedTable = null;
+        private String referencedColumn = null;
 
         public Builder name(String name) {
             this.name = name;
@@ -140,8 +164,20 @@ public class ColumnDefinition {
             return this;
         }
 
-        public ColumnDefinition build() {
-            return new ColumnDefinition(name, sqlType, nullable, primaryKey, autoIncrement, defaultValue, length);
+        public Builder referencedTable(String referencedTable) {
+            this.referencedTable = referencedTable;
+            return this;
         }
+
+        public Builder referencedColumn(String referencedColumn) {
+            this.referencedColumn = referencedColumn;
+            return this;
+        }
+
+        public ColumnDefinition build() {
+            return new ColumnDefinition(name, sqlType, nullable, primaryKey, autoIncrement, defaultValue, length, referencedTable, referencedColumn);
+        }
+
     }
+
 }

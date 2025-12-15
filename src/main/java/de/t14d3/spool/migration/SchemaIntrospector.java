@@ -1,5 +1,7 @@
 package de.t14d3.spool.migration;
 
+
+
 import de.t14d3.spool.annotations.Column;
 import de.t14d3.spool.annotations.Id;
 import de.t14d3.spool.annotations.ManyToOne;
@@ -365,6 +367,8 @@ public class SchemaIntrospector {
             String sqlType = TypeMapper.javaTypeToSqlType(field.getType());
             Integer length = null;
             boolean nullable = true;
+            String referencedTable = null;
+            String referencedColumn = null;
 
             // Check for @Column annotation
             if (field.isAnnotationPresent(Column.class)) {
@@ -389,25 +393,46 @@ public class SchemaIntrospector {
 
             // Handle @ManyToOne - foreign key columns
             if (field.isAnnotationPresent(ManyToOne.class)) {
+                ManyToOne manyToOne = field.getAnnotation(ManyToOne.class);
                 // Foreign key is typically the ID type of the related entity; fall back to BIGINT
                 sqlType = "BIGINT";
                 nullable = true;
+                
+                // Determine referenced table and column
+                // Determine referenced table and column from field type
+                Class<?> targetEntityClass = field.getType();
+                if (targetEntityClass != null) {
+                    EntityMetadata targetMetadata = EntityMetadata.of(targetEntityClass);
+                    referencedTable = targetMetadata.getTableName();
+                    referencedColumn = targetMetadata.getIdColumnName();
+                } else {
+                    // Fallback to field name convention
+                    referencedTable = field.getType().getSimpleName().toLowerCase();
+                    referencedColumn = "id";
+                }
+
             }
 
-            ColumnDefinition column = new ColumnDefinition.Builder()
+            ColumnDefinition.Builder builder = new ColumnDefinition.Builder()
                     .name(columnName)
                     .sqlType(sqlType)
                     .nullable(nullable)
                     .primaryKey(isPrimaryKey)
                     .autoIncrement(isAutoIncrement)
-                    .length(length)
-                    .build();
-
+                    .length(length);
+            
+            if (referencedTable != null && referencedColumn != null) {
+                builder.referencedTable(referencedTable)
+                       .referencedColumn(referencedColumn);
+            }
+            
+            ColumnDefinition column = builder.build();
             table.addColumn(column);
         }
 
         return table;
     }
+
 
     // -----------------------
     // Type mapping helpers

@@ -57,6 +57,7 @@ public class SqlGenerator {
 
         List<String> columnDefs = new ArrayList<>();
         List<String> primaryKeys = new ArrayList<>();
+        List<String> foreignKeyConstraints = new ArrayList<>();
 
         for (ColumnDefinition column : table.getColumns().values()) {
             StringBuilder colDef = new StringBuilder();
@@ -88,9 +89,23 @@ public class SqlGenerator {
             sql.append(",\n  PRIMARY KEY (").append(String.join(", ", primaryKeys)).append(")");
         }
 
+        // Add foreign key constraints
+        for (ColumnDefinition column : table.getColumns().values()) {
+            if (column.isForeignKey()) {
+                String constraint = String.format("  FOREIGN KEY (%s) REFERENCES %s(%s)",
+                    column.getName(), column.getReferencedTable(), column.getReferencedColumn());
+                foreignKeyConstraints.add(constraint);
+            }
+        }
+
+        if (!foreignKeyConstraints.isEmpty()) {
+            sql.append(",\n").append(String.join(",\n", foreignKeyConstraints));
+        }
+
         sql.append("\n)");
 
         return sql.toString();
+
     }
 
     /**
