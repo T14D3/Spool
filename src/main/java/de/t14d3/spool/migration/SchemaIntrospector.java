@@ -73,7 +73,7 @@ public class SchemaIntrospector {
         
         // First get primary keys - filter by schema
         Set<String> primaryKeys = new HashSet<>();
-        try (ResultSet rs = metaData.getPrimaryKeys(null, schema, tableName.toUpperCase())) {
+        try (ResultSet rs = metaData.getPrimaryKeys(null, schema, tableName)) {
             while (rs.next()) {
                 String foundTable = rs.getString("TABLE_NAME");
                 String foundSchema = rs.getString("TABLE_SCHEM");
