@@ -9,6 +9,7 @@ import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.UUID;
 
 /**
  * Centralized type mapping utilities for converting between Java types and SQL types,
@@ -21,6 +22,8 @@ public class TypeMapper {
      */
     public static String javaTypeToSqlType(Class<?> javaType) {
         if (javaType == String.class) {
+            return "VARCHAR";
+        } else if (javaType == UUID.class) {
             return "VARCHAR";
         } else if (javaType == Long.class || javaType == long.class) {
             return "BIGINT";
@@ -73,6 +76,12 @@ public class TypeMapper {
             if (value instanceof Number) return ((Number) value).shortValue();
         } else if (targetType == Byte.class || targetType == byte.class) {
             if (value instanceof Number) return ((Number) value).byteValue();
+        } else if (targetType == UUID.class) {
+            if (value instanceof String) {
+                return UUID.fromString((String) value);
+            } else if (value instanceof UUID) {
+                return value;
+            }
         } else if (targetType == String.class) {
             return value.toString();
         } else if (targetType == Boolean.class || targetType == boolean.class) {
