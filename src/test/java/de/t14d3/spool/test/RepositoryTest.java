@@ -129,4 +129,41 @@ public class RepositoryTest {
         assertEquals(2, userRepo.count());
         assertFalse(userRepo.existsById(user3.getId()));
     }
+
+    @Test
+    void testFindBy() {
+        // Create and save a user
+        User user = new User("john_doe", "john@example.com");
+        assertNull(user.getId());
+
+        userRepo.save(user);
+        em.flush();
+
+        assertNotNull(user.getId());
+
+        // Find by ID
+        User foundUser = userRepo.findById(user.getId());
+        assertNotNull(foundUser);
+        assertEquals("john_doe", foundUser.getUsername());
+        assertEquals("john@example.com", foundUser.getEmail());
+
+        // Find by username
+        List<User> foundUsers = userRepo.findBy("username", "john_doe");
+        assertEquals(1, foundUsers.size());
+        assertEquals("john_doe", foundUsers.get(0).getUsername());
+
+        // Find by email
+        foundUsers = userRepo.findBy("email", "john@example.com");
+        assertEquals(1, foundUsers.size());
+        assertEquals("john_doe", foundUsers.get(0).getUsername());
+
+        // Find one by
+        foundUser = userRepo.findOneBy("username", "john_doe");
+        assertNotNull(foundUser);
+        assertEquals("john_doe", foundUser.getUsername());
+
+        foundUser = userRepo.findOneBy("email", "john@example.com");
+        assertNotNull(foundUser);
+        assertEquals("john_doe", foundUser.getUsername());
+    }
 }

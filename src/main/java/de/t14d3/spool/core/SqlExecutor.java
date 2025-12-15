@@ -225,7 +225,7 @@ public class SqlExecutor {
     // ---------------------------------------------------------------------
 
     @SuppressWarnings("unchecked")
-    private <T> T mapResultSetToEntity(ResultSet rs, EntityMetadata metadata) throws SQLException {
+    public static <T> T mapResultSetToEntity(ResultSet rs, EntityMetadata metadata) throws SQLException {
         Object entity = metadata.newInstance();
 
         for (Field field : metadata.getFields()) {
@@ -260,7 +260,7 @@ public class SqlExecutor {
     /**
      * Convert DB column value to a Java field type where needed.
      */
-    private Object convertToFieldType(Object value, Class<?> targetType) {
+    public static Object convertToFieldType(Object value, Class<?> targetType) {
         if (value == null) return null;
 
         if (targetType == Long.class || targetType == long.class) {
@@ -298,8 +298,8 @@ public class SqlExecutor {
     // PreparedStatement parameter binding with simple type handling
     // ---------------------------------------------------------------------
 
-    private void setParameters(PreparedStatement stmt, List<Object> params) throws SQLException {
-        if (params == null || params.isEmpty()) return;
+    public static PreparedStatement setParameters(PreparedStatement stmt, List<Object> params) throws SQLException {
+        if (params == null || params.isEmpty()) return stmt;
 
         for (int i = 0; i < params.size(); i++) {
             Object p = params.get(i);
@@ -327,5 +327,6 @@ public class SqlExecutor {
                         stmt.setObject(idx, p);
             }
         }
+        return stmt;
     }
 }
