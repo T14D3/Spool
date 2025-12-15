@@ -200,6 +200,13 @@ public class SchemaIntrospector {
             if (field.isAnnotationPresent(Column.class)) {
                 Column columnAnnotation = field.getAnnotation(Column.class);
                 nullable = columnAnnotation.nullable();
+
+                // Use explicit type if specified, otherwise infer from Java type
+                String explicitType = columnAnnotation.type().trim();
+                if (!explicitType.isEmpty()) {
+                    sqlType = explicitType;
+                }
+
                 if (field.getType() == String.class) {
                     length = columnAnnotation.length();
                 }

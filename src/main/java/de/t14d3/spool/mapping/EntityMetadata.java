@@ -24,6 +24,7 @@ public class EntityMetadata {
     private final List<Field> fields;
     private final Map<String, Field> columnToField;
     private final Map<Field, String> fieldToColumn;
+    private final Map<Field, String> fieldToColumnType;
 
     private EntityMetadata(Class<?> entityClass) {
         this.entityClass = entityClass;
@@ -41,6 +42,7 @@ public class EntityMetadata {
         this.fields = new ArrayList<>();
         this.columnToField = new HashMap<>();
         this.fieldToColumn = new HashMap<>();
+        this.fieldToColumnType = new HashMap<>();
         Field foundIdField = null;
         boolean foundAutoIncrement = false;
 
@@ -56,6 +58,10 @@ public class EntityMetadata {
                 if (field.isAnnotationPresent(Column.class)) {
                     Column column = field.getAnnotation(Column.class);
                     String columnName = column.name();
+                    String columnType = column.type().trim();
+                    if (!columnType.isEmpty()) {
+                        fieldToColumnType.put(field, columnType);
+                    }
                     fields.add(field);
                     columnToField.put(columnName, field);
                     fieldToColumn.put(field, columnName);
@@ -73,6 +79,10 @@ public class EntityMetadata {
                 fields.add(field);
                 Column column = field.getAnnotation(Column.class);
                 String columnName = column.name();
+                String columnType = column.type().trim();
+                if (!columnType.isEmpty()) {
+                    fieldToColumnType.put(field, columnType);
+                }
                 columnToField.put(columnName, field);
                 fieldToColumn.put(field, columnName);
             } else if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
@@ -134,6 +144,14 @@ public class EntityMetadata {
 
     public Field getField(String columnName) {
         return columnToField.get(columnName);
+    }
+
+    /**
+     * Gets the explicit column type for the given field, if specified.
+     * Returns null if no explicit type was specified.
+     */
+    public String getColumnType(Field field) {
+        return fieldToColumnType.get(field);
     }
 
     /**
