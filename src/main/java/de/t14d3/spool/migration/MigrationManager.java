@@ -97,6 +97,11 @@ public class MigrationManager {
             TableDefinition table = introspector.buildTableDefinitionFromEntity(entityClass);
             expectedSchema.put(table.getName().toLowerCase(), table);
         }
+        for (Class<?> entityClass : entityClasses) {
+            for (TableDefinition join : introspector.buildJoinTableDefinitionsFromEntity(entityClass)) {
+                expectedSchema.putIfAbsent(join.getName().toLowerCase(), join);
+            }
+        }
 
         // Get actual schema from database
         Map<String, TableDefinition> actualSchema = new LinkedHashMap<>();
@@ -122,6 +127,11 @@ public class MigrationManager {
         for (Class<?> entityClass : entityClasses) {
             TableDefinition table = introspector.buildTableDefinitionFromEntity(entityClass);
             expectedSchema.put(table.getName().toLowerCase(), table);
+        }
+        for (Class<?> entityClass : entityClasses) {
+            for (TableDefinition join : introspector.buildJoinTableDefinitionsFromEntity(entityClass)) {
+                expectedSchema.putIfAbsent(join.getName().toLowerCase(), join);
+            }
         }
 
         Map<String, TableDefinition> actualSchema = new LinkedHashMap<>();

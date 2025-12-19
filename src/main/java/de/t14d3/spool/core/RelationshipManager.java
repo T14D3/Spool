@@ -6,7 +6,10 @@ import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.mapping.RelationshipMapping;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Manages entity relationships and cascading operations.
@@ -15,15 +18,20 @@ import java.util.*;
 public class RelationshipManager {
 
     private final EntityManager entityManager;
+    private final Map<Class<?>, List<RelationshipMapping>> relationshipCache;
+    private final ThreadLocal<Integer> bidirectionalSyncDepth;
 
     public RelationshipManager(EntityManager entityManager) {
         this.entityManager = entityManager;
+        this.relationshipCache = new ConcurrentHashMap<>();
+        this.bidirectionalSyncDepth = ThreadLocal.withInitial(() -> 0);
     }
 
     /**
      * Handles cascade persist operations for an entity.
      */
     public void cascadePersist(Object entity, EntityMetadata metadata) {
+        prepareRelationships(entity, metadata);
         List<RelationshipMapping> relationships = getRelationships(metadata);
 
         for (RelationshipMapping relationship : relationships) {
@@ -40,6 +48,7 @@ public class RelationshipManager {
      * Handles cascade remove operations for an entity.
      */
     public void cascadeRemove(Object entity, EntityMetadata metadata) {
+        prepareRelationships(entity, metadata);
         List<RelationshipMapping> relationships = getRelationships(metadata);
 
         for (RelationshipMapping relationship : relationships) {
@@ -81,6 +90,7 @@ public class RelationshipManager {
      * Handles cascade detach operations for an entity.
      */
     public void cascadeDetach(Object entity, EntityMetadata metadata) {
+        prepareRelationships(entity, metadata);
         List<RelationshipMapping> relationships = getRelationships(metadata);
 
         for (RelationshipMapping relationship : relationships) {
@@ -97,6 +107,7 @@ public class RelationshipManager {
      * Handles cascade refresh operations for an entity.
      */
     public void cascadeRefresh(Object entity, EntityMetadata metadata) {
+        prepareRelationships(entity, metadata);
         List<RelationshipMapping> relationships = getRelationships(metadata);
 
         for (RelationshipMapping relationship : relationships) {
@@ -113,6 +124,7 @@ public class RelationshipManager {
      * Handles cascade merge operations for an entity.
      */
     public void cascadeMerge(Object entity, EntityMetadata metadata) {
+        prepareRelationships(entity, metadata);
         List<RelationshipMapping> relationships = getRelationships(metadata);
 
         for (RelationshipMapping relationship : relationships) {
@@ -241,16 +253,20 @@ public class RelationshipManager {
      * Gets all relationships for an entity.
      */
     private List<RelationshipMapping> getRelationships(EntityMetadata metadata) {
-        List<RelationshipMapping> relationships = new ArrayList<>();
-
-        for (Field field : metadata.getEntityClass().getDeclaredFields()) {
-            RelationshipMapping relationship = createRelationshipMapping(field, metadata);
-            if (relationship != null) {
-                relationships.add(relationship);
+        return relationshipCache.computeIfAbsent(metadata.getEntityClass(), cls -> {
+            List<RelationshipMapping> relationships = new ArrayList<>();
+            for (Field field : cls.getDeclaredFields()) {
+                RelationshipMapping relationship = createRelationshipMapping(field, metadata);
+                if (relationship != null) {
+                    relationships.add(relationship);
+                }
             }
-        }
+            return List.copyOf(relationships);
+        });
+    }
 
-        return relationships;
+    List<RelationshipMapping> getRelationshipMappings(EntityMetadata metadata) {
+        return getRelationships(metadata);
     }
 
     /**
@@ -304,7 +320,7 @@ public class RelationshipManager {
             var annotation = field.getAnnotation(de.t14d3.spool.annotations.ManyToMany.class);
             return new RelationshipMapping(
                     field,
-                    field.getType(),
+                    resolveCollectionElementType(field),
                     RelationshipMapping.RelationshipType.MANY_TO_MANY,
                     annotation.mappedBy(),
                     annotation.fetch(),
@@ -313,5 +329,596 @@ public class RelationshipManager {
         }
 
         return null;
+    }
+
+    /**
+     * Prepare relationship fields (currently focused on ManyToMany) to keep object graphs consistent.
+     *
+     * This wraps ManyToMany collections so that add/remove operations update the inverse side.
+     * It's safe to call multiple times.
+     */
+    public void prepareRelationships(Object entity, EntityMetadata metadata) {
+        if (entity == null) {
+            return;
+        }
+
+        for (RelationshipMapping relationship : getRelationships(metadata)) {
+            if (relationship.relationshipType() != RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+                continue;
+            }
+
+            Field ownerField = relationship.field();
+            Class<?> targetEntity = relationship.targetEntity();
+            if (targetEntity == Object.class) {
+                // Cannot reliably manage ManyToMany without knowing the element type.
+                continue;
+            }
+
+            Field inverseField = resolveManyToManyInverseField(metadata.getEntityClass(), ownerField, targetEntity, relationship.mappedBy());
+            if (inverseField == null) {
+                // Unidirectional ManyToMany; nothing to sync.
+                continue;
+            }
+
+            wrapManyToManyCollection(entity, ownerField, inverseField);
+
+            Object current = getFieldValue(entity, ownerField);
+            if (!(current instanceof Collection<?> collection)) {
+                continue;
+            }
+
+            for (Object related : collection) {
+                if (related == null) continue;
+                wrapManyToManyCollection(related, inverseField, ownerField);
+                ensureInverseContains(entity, related, inverseField);
+            }
+        }
+    }
+
+    /**
+     * Eagerly hydrate single-reference relationships (ManyToOne/OneToOne) when configured with fetch=true.
+     *
+     * This intentionally does not attempt to make single refs lazy; if fetch=false the reference remains
+     * a stub (id-only) created by row mapping or user code.
+     */
+    public void hydrateEagerSingleRefs(Object entity, EntityMetadata metadata) {
+        if (entity == null) {
+            return;
+        }
+
+        for (RelationshipMapping relationship : getRelationships(metadata)) {
+            if (relationship.relationshipType() != RelationshipMapping.RelationshipType.MANY_TO_ONE
+                    && relationship.relationshipType() != RelationshipMapping.RelationshipType.ONE_TO_ONE) {
+                continue;
+            }
+            if (!relationship.fetch()) {
+                continue;
+            }
+
+            Object related = getFieldValue(entity, relationship.field());
+            if (related == null) {
+                continue;
+            }
+
+            EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
+            Object relatedId = relatedMeta.getIdValue(related);
+            if (relatedId == null) {
+                continue;
+            }
+
+            Object managed = entityManager.find(related.getClass(), relatedId);
+            if (managed != null && managed != related) {
+                setFieldValue(entity, relationship.field(), managed);
+            }
+        }
+    }
+
+    /**
+     * Remove ManyToMany links from both sides (used when deleting an entity).
+     */
+    public void unlinkManyToMany(Object entity, EntityMetadata metadata) {
+        if (entity == null) {
+            return;
+        }
+
+        for (RelationshipMapping relationship : getRelationships(metadata)) {
+            if (relationship.relationshipType() != RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+                continue;
+            }
+
+            Field ownerField = relationship.field();
+            Class<?> targetEntity = relationship.targetEntity();
+            if (targetEntity == Object.class) {
+                continue;
+            }
+
+            Field inverseField = resolveManyToManyInverseField(metadata.getEntityClass(), ownerField, targetEntity, relationship.mappedBy());
+            if (inverseField == null) {
+                continue;
+            }
+
+            Object current = getFieldValue(entity, ownerField);
+            if (!(current instanceof Collection<?> collection)) {
+                continue;
+            }
+
+            // Create a copy so we can modify collections safely.
+            List<Object> relatedItems = new ArrayList<>();
+            for (Object r : collection) {
+                if (r != null) {
+                    relatedItems.add(r);
+                }
+            }
+
+            for (Object related : relatedItems) {
+                removeInverseLink(entity, related, inverseField);
+            }
+
+            withoutBidirectionalSync(collection::clear);
+        }
+    }
+
+    private void wrapManyToManyCollection(Object owner, Field ownerField, Field inverseField) {
+        Object current = getFieldValue(owner, ownerField);
+        if (current instanceof BidirectionalManagedCollection) {
+            return;
+        }
+
+        Collection<Object> base = getOrCreateCollection(owner, ownerField);
+        Class<?> declared = ownerField.getType();
+
+        Object wrapped;
+        if (List.class.isAssignableFrom(declared)) {
+            @SuppressWarnings("unchecked")
+            List<Object> list = (base instanceof List<?>) ? (List<Object>) base : new ArrayList<>(base);
+            wrapped = new ManyToManyList(owner, ownerField, inverseField, list, this);
+        } else if (Set.class.isAssignableFrom(declared)) {
+            @SuppressWarnings("unchecked")
+            Set<Object> set = (base instanceof Set<?>) ? (Set<Object>) base : new LinkedHashSet<>(base);
+            wrapped = new ManyToManySet(owner, ownerField, inverseField, set, this);
+        } else if (Collection.class.isAssignableFrom(declared)) {
+            wrapped = new ManyToManyCollection(owner, ownerField, inverseField, base, this);
+        } else {
+            // Not a collection; can't manage.
+            return;
+        }
+
+        setFieldValue(owner, ownerField, wrapped);
+    }
+
+    private void ensureInverseContains(Object owner, Object related, Field inverseField) {
+        Object inverse = getFieldValue(related, inverseField);
+        if (inverse == null) {
+            inverse = getOrCreateCollection(related, inverseField);
+        }
+        if (!(inverse instanceof Collection<?> inverseCollection)) {
+            return;
+        }
+        if (inverseCollection.contains(owner)) {
+            return;
+        }
+        withoutBidirectionalSync(() -> ((Collection<Object>) inverseCollection).add(owner));
+    }
+
+    private void removeInverseLink(Object owner, Object related, Field inverseField) {
+        Object inverse = getFieldValue(related, inverseField);
+        if (!(inverse instanceof Collection<?> inverseCollection)) {
+            return;
+        }
+        if (!inverseCollection.contains(owner)) {
+            return;
+        }
+        withoutBidirectionalSync(() -> ((Collection<Object>) inverseCollection).remove(owner));
+    }
+
+    private void withoutBidirectionalSync(Runnable work) {
+        bidirectionalSyncDepth.set(bidirectionalSyncDepth.get() + 1);
+        try {
+            work.run();
+        } finally {
+            bidirectionalSyncDepth.set(Math.max(0, bidirectionalSyncDepth.get() - 1));
+        }
+    }
+
+    private boolean isBidirectionalSyncSuppressed() {
+        return bidirectionalSyncDepth.get() > 0;
+    }
+
+    private static Object getFieldValue(Object target, Field field) {
+        try {
+            field.setAccessible(true);
+            return field.get(target);
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException("Cannot access relationship field " + field.getName(), e);
+        }
+    }
+
+    private static void setFieldValue(Object target, Field field, Object value) {
+        try {
+            field.setAccessible(true);
+            field.set(target, value);
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException("Cannot set relationship field " + field.getName(), e);
+        }
+    }
+
+    private static Collection<Object> getOrCreateCollection(Object owner, Field field) {
+        Object current = getFieldValue(owner, field);
+        if (current instanceof Collection<?> c) {
+            @SuppressWarnings("unchecked")
+            Collection<Object> out = (Collection<Object>) c;
+            return out;
+        }
+
+        if (current != null) {
+            throw new IllegalStateException("Field " + field.getDeclaringClass().getName() + "." + field.getName() + " is not a Collection");
+        }
+
+        Collection<Object> created;
+        Class<?> declared = field.getType();
+        if (List.class.isAssignableFrom(declared)) {
+            created = new ArrayList<>();
+        } else if (Set.class.isAssignableFrom(declared)) {
+            created = new LinkedHashSet<>();
+        } else if (Collection.class.isAssignableFrom(declared)) {
+            created = new ArrayList<>();
+        } else {
+            throw new IllegalStateException("Field " + field.getDeclaringClass().getName() + "." + field.getName() + " must be a Collection for ManyToMany");
+        }
+
+        setFieldValue(owner, field, created);
+        return created;
+    }
+
+    private static Class<?> resolveCollectionElementType(Field field) {
+        Type t = field.getGenericType();
+        if (!(t instanceof ParameterizedType pt)) {
+            return Object.class;
+        }
+        Type[] args = pt.getActualTypeArguments();
+        if (args.length != 1) {
+            return Object.class;
+        }
+        Type arg = args[0];
+        if (arg instanceof Class<?> c) {
+            return c;
+        }
+        if (arg instanceof ParameterizedType apt && apt.getRawType() instanceof Class<?> c) {
+            return c;
+        }
+        return Object.class;
+    }
+
+    private static Field resolveManyToManyInverseField(Class<?> ownerEntity, Field ownerField, Class<?> targetEntity, String mappedBy) {
+        if (mappedBy != null && !mappedBy.isBlank()) {
+            // This side is inverse; mappedBy points to the owning field on the target entity.
+            return findField(targetEntity, mappedBy);
+        }
+
+        // Owning side; find inverse field on target that maps back to this field name.
+        String ownerFieldName = ownerField.getName();
+        for (Field f : targetEntity.getDeclaredFields()) {
+            if (!f.isAnnotationPresent(de.t14d3.spool.annotations.ManyToMany.class)) {
+                continue;
+            }
+            var ann = f.getAnnotation(de.t14d3.spool.annotations.ManyToMany.class);
+            if (!ownerFieldName.equals(ann.mappedBy())) {
+                continue;
+            }
+            if (!Collection.class.isAssignableFrom(f.getType())) {
+                continue;
+            }
+            f.setAccessible(true);
+            return f;
+        }
+
+        // No bidirectional mapping found.
+        return null;
+    }
+
+    private static Field findField(Class<?> type, String fieldName) {
+        try {
+            Field f = type.getDeclaredField(fieldName);
+            f.setAccessible(true);
+            return f;
+        } catch (NoSuchFieldException e) {
+            return null;
+        }
+    }
+
+    private interface BidirectionalManagedCollection {
+        // marker
+    }
+
+    private static final class ManyToManyCollection extends AbstractCollection<Object> implements BidirectionalManagedCollection {
+        private final Object owner;
+        private final Field ownerField;
+        private final Field inverseField;
+        private final Collection<Object> delegate;
+        private final RelationshipManager manager;
+
+        private ManyToManyCollection(Object owner, Field ownerField, Field inverseField, Collection<Object> delegate, RelationshipManager manager) {
+            this.owner = owner;
+            this.ownerField = ownerField;
+            this.inverseField = inverseField;
+            this.delegate = delegate;
+            this.manager = manager;
+        }
+
+        @Override
+        public Iterator<Object> iterator() {
+            Iterator<Object> it = delegate.iterator();
+            return new Iterator<>() {
+                private Object last;
+
+                @Override
+                public boolean hasNext() {
+                    return it.hasNext();
+                }
+
+                @Override
+                public Object next() {
+                    last = it.next();
+                    return last;
+                }
+
+                @Override
+                public void remove() {
+                    it.remove();
+                    if (manager.isBidirectionalSyncSuppressed() || last == null) {
+                        return;
+                    }
+                    manager.removeInverseLink(owner, last, inverseField);
+                }
+            };
+        }
+
+        @Override
+        public int size() {
+            return delegate.size();
+        }
+
+        @Override
+        public boolean add(Object o) {
+            boolean added = delegate.add(o);
+            if (!added || manager.isBidirectionalSyncSuppressed() || o == null) {
+                return added;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            manager.wrapManyToManyCollection(o, inverseField, ownerField);
+            manager.ensureInverseContains(owner, o, inverseField);
+            return true;
+        }
+
+        @Override
+        public boolean remove(Object o) {
+            boolean removed = delegate.remove(o);
+            if (!removed || manager.isBidirectionalSyncSuppressed() || o == null) {
+                return removed;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            manager.removeInverseLink(owner, o, inverseField);
+            return true;
+        }
+
+        @Override
+        public void clear() {
+            if (manager.isBidirectionalSyncSuppressed()) {
+                delegate.clear();
+                return;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            List<Object> items = new ArrayList<>(delegate);
+            delegate.clear();
+            for (Object item : items) {
+                if (item != null) {
+                    manager.removeInverseLink(owner, item, inverseField);
+                }
+            }
+        }
+    }
+
+    private static final class ManyToManyList extends AbstractList<Object> implements BidirectionalManagedCollection {
+        private final Object owner;
+        private final Field ownerField;
+        private final Field inverseField;
+        private final List<Object> delegate;
+        private final RelationshipManager manager;
+
+        private ManyToManyList(Object owner, Field ownerField, Field inverseField, List<Object> delegate, RelationshipManager manager) {
+            this.owner = owner;
+            this.ownerField = ownerField;
+            this.inverseField = inverseField;
+            this.delegate = delegate;
+            this.manager = manager;
+        }
+
+        @Override
+        public Object get(int index) {
+            return delegate.get(index);
+        }
+
+        @Override
+        public int size() {
+            return delegate.size();
+        }
+
+        @Override
+        public Object set(int index, Object element) {
+            Object old = delegate.set(index, element);
+            if (manager.isBidirectionalSyncSuppressed()) {
+                return old;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            if (old != null) {
+                manager.removeInverseLink(owner, old, inverseField);
+            }
+            if (element != null) {
+                manager.wrapManyToManyCollection(element, inverseField, ownerField);
+                manager.ensureInverseContains(owner, element, inverseField);
+            }
+            return old;
+        }
+
+        @Override
+        public void add(int index, Object element) {
+            delegate.add(index, element);
+            if (manager.isBidirectionalSyncSuppressed() || element == null) {
+                return;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            manager.wrapManyToManyCollection(element, inverseField, ownerField);
+            manager.ensureInverseContains(owner, element, inverseField);
+        }
+
+        @Override
+        public boolean add(Object element) {
+            boolean added = delegate.add(element);
+            if (!added || manager.isBidirectionalSyncSuppressed() || element == null) {
+                return added;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            manager.wrapManyToManyCollection(element, inverseField, ownerField);
+            manager.ensureInverseContains(owner, element, inverseField);
+            return true;
+        }
+
+        @Override
+        public Object remove(int index) {
+            Object removed = delegate.remove(index);
+            if (manager.isBidirectionalSyncSuppressed() || removed == null) {
+                return removed;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            manager.removeInverseLink(owner, removed, inverseField);
+            return removed;
+        }
+
+        @Override
+        public boolean remove(Object o) {
+            boolean removed = delegate.remove(o);
+            if (!removed || manager.isBidirectionalSyncSuppressed() || o == null) {
+                return removed;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            manager.removeInverseLink(owner, o, inverseField);
+            return true;
+        }
+
+        @Override
+        public void clear() {
+            if (manager.isBidirectionalSyncSuppressed()) {
+                delegate.clear();
+                return;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            List<Object> items = new ArrayList<>(delegate);
+            delegate.clear();
+            for (Object item : items) {
+                if (item != null) {
+                    manager.removeInverseLink(owner, item, inverseField);
+                }
+            }
+        }
+    }
+
+    private static final class ManyToManySet extends AbstractSet<Object> implements BidirectionalManagedCollection {
+        private final Object owner;
+        private final Field ownerField;
+        private final Field inverseField;
+        private final Set<Object> delegate;
+        private final RelationshipManager manager;
+
+        private ManyToManySet(Object owner, Field ownerField, Field inverseField, Set<Object> delegate, RelationshipManager manager) {
+            this.owner = owner;
+            this.ownerField = ownerField;
+            this.inverseField = inverseField;
+            this.delegate = delegate;
+            this.manager = manager;
+        }
+
+        @Override
+        public Iterator<Object> iterator() {
+            Iterator<Object> it = delegate.iterator();
+            return new Iterator<>() {
+                private Object last;
+
+                @Override
+                public boolean hasNext() {
+                    return it.hasNext();
+                }
+
+                @Override
+                public Object next() {
+                    last = it.next();
+                    return last;
+                }
+
+                @Override
+                public void remove() {
+                    it.remove();
+                    if (manager.isBidirectionalSyncSuppressed() || last == null) {
+                        return;
+                    }
+                    manager.removeInverseLink(owner, last, inverseField);
+                }
+            };
+        }
+
+        @Override
+        public int size() {
+            return delegate.size();
+        }
+
+        @Override
+        public boolean add(Object o) {
+            boolean added = delegate.add(o);
+            if (!added || manager.isBidirectionalSyncSuppressed() || o == null) {
+                return added;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            manager.wrapManyToManyCollection(o, inverseField, ownerField);
+            manager.ensureInverseContains(owner, o, inverseField);
+            return true;
+        }
+
+        @Override
+        public boolean remove(Object o) {
+            boolean removed = delegate.remove(o);
+            if (!removed || manager.isBidirectionalSyncSuppressed() || o == null) {
+                return removed;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            manager.removeInverseLink(owner, o, inverseField);
+            return true;
+        }
+
+        @Override
+        public void clear() {
+            if (manager.isBidirectionalSyncSuppressed()) {
+                delegate.clear();
+                return;
+            }
+            manager.entityManager.markDirty(owner);
+            manager.entityManager.markManyToManyDirty(owner, ownerField);
+            List<Object> items = new ArrayList<>(delegate);
+            delegate.clear();
+            for (Object item : items) {
+                if (item != null) {
+                    manager.removeInverseLink(owner, item, inverseField);
+                }
+            }
+        }
     }
 }

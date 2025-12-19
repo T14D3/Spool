@@ -124,12 +124,21 @@ public class AutomaticRelationshipMigrationTest {
         // Should have at least one CREATE TABLE statement for books with foreign key
         boolean foundBooksCreateWithFk = sqlStatements.stream()
             .anyMatch(sql -> sql.contains("CREATE TABLE") && 
-                             (sql.contains("books") || sql.contains("BOOKS")) && 
+                             (sql.contains("books") || sql.contains("BOOKS")) &&
                              sql.contains("FOREIGN KEY") &&
                              sql.contains("author_id"));
 
         assertTrue(foundBooksCreateWithFk, "Should generate CREATE TABLE for books with foreign key constraint");
         System.out.println("✓ Migration SQL includes foreign key constraints");
+
+        // Apply the migration
+        int changesApplied = em.updateSchema();
+        System.out.println("Applied " + changesApplied + " schema changes");
+
+        // Verify tables exist
+        assertTrue(em.getMigrationManager().getIntrospector().tableExists("authors"), "Authors table should exist");
+        assertTrue(em.getMigrationManager().getIntrospector().tableExists("books"), "Books table should exist");
+        System.out.println("✓ Both tables created successfully");
 
     }
 }

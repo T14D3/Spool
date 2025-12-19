@@ -13,6 +13,8 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 
 /**
  * Executes SQL queries and maps results to entities.
@@ -192,22 +194,35 @@ public class SqlExecutor {
         }
     }
 
-    public void update(Object entity, EntityMetadata metadata) {
+    public void update(Object entity, EntityMetadata metadata, Map<Field, Object> snapshot) {
         Query.UpdateBuilder ub = Query.update(dialect, metadata.getTableName());
+        boolean hasSnapshot = snapshot != null;
+        boolean isDirty = false;
         for (Field field : metadata.getFields()) {
             if (field.equals(metadata.getIdField())) continue;
 
-            if (field.isAnnotationPresent(ManyToOne.class)) {
-                Object related = metadata.getFieldValue(entity, field);
-                if (related == null) {
-                    ub.set(metadata.getColumnName(field), null);
+            Object current = metadata.getFieldValue(entity, field);
+            Object original = hasSnapshot ? snapshot.get(field) : null;
+
+            if (!hasSnapshot || !Objects.equals(current, original)) {
+                if (field.isAnnotationPresent(ManyToOne.class)) {
+                    Object related = metadata.getFieldValue(entity, field);
+                    if (related == null) {
+                        ub.set(metadata.getColumnName(field), null);
+                    } else {
+                        EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
+                        ub.set(metadata.getColumnName(field), relatedMeta.getIdValue(related));
+                    }
                 } else {
-                    EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
-                    ub.set(metadata.getColumnName(field), relatedMeta.getIdValue(related));
+                    ub.set(metadata.getColumnName(field), current);
                 }
-            } else {
-                ub.set(metadata.getColumnName(field), metadata.getFieldValue(entity, field));
+                isDirty = true;
             }
+        }
+
+        // If no fields to update (no changes), skip the update
+        if (!isDirty) {
+            return;
         }
 
         Object idValue = metadata.getIdValue(entity);
@@ -243,11 +258,17 @@ public class SqlExecutor {
             }
 
             // For ManyToOne we currently do not eagerly load related entity;
-            // instead keep the relation null (or you can load lazily later).
+            // instead store an id-only stub entity. EntityManager may later eagerly hydrate it.
             if (field.isAnnotationPresent(ManyToOne.class)) {
-                // Optionally, you could set the foreign key id into a backing field
-                // or create a proxy. For now we don't set a relationship object.
-                metadata.setFieldValue(entity, field, null);
+                if (raw == null) {
+                    metadata.setFieldValue(entity, field, null);
+                } else {
+                    EntityMetadata relatedMeta = EntityMetadata.of(field.getType());
+                    Object related = relatedMeta.newInstance();
+                    Object convertedId = de.t14d3.spool.mapping.TypeMapper.convertToJavaType(raw, relatedMeta.getIdField().getType());
+                    relatedMeta.setIdValue(related, convertedId);
+                    metadata.setFieldValue(entity, field, related);
+                }
                 continue;
             }
 

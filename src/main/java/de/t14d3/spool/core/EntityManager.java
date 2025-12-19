@@ -1,5 +1,13 @@
 package de.t14d3.spool.core;
 
+import de.t14d3.spool.cache.CacheKey;
+import de.t14d3.spool.cache.CacheEvent;
+import de.t14d3.spool.cache.CacheEventSink;
+import de.t14d3.spool.cache.CacheProvider;
+import de.t14d3.spool.cache.EntitySnapshot;
+import de.t14d3.spool.cache.NoOpCacheEventSink;
+import de.t14d3.spool.cache.NoOpCacheProvider;
+import de.t14d3.spool.annotations.JoinTable;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.migration.MigrationManager;
 import de.t14d3.spool.migration.PersistentMigrationManager;
@@ -14,8 +22,11 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Savepoint;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -29,10 +40,15 @@ public class EntityManager {
     private final Connection connection;
     private final Dialect dialect;
     private final ConcurrentHashMap<EntityKey, Object> identityMap;
+    private final ConcurrentHashMap<EntityKey, Map<Field, Object>> originalValues;
     private final Set<Object> pendingInserts;
     private final Set<Object> pendingUpdates;
     private final Set<Object> pendingDeletes;
     private final RelationshipManager relationshipManager;
+    private final Set<ManyToManyDirtyKey> dirtyManyToMany;
+    private CacheProvider cacheProvider;
+    private CacheEventSink cacheEventSink;
+    private Duration cacheTtl;
     private boolean transactionActive;
     private boolean originalAutoCommit;
     private MigrationManager migrationManager;
@@ -44,10 +60,15 @@ public class EntityManager {
         this.dialect = dialect;
         this.executor = new SqlExecutor(connection);
         this.identityMap = new ConcurrentHashMap<>();
+        this.originalValues = new ConcurrentHashMap<>();
         this.pendingInserts = new LinkedHashSet<>();
         this.pendingUpdates = new LinkedHashSet<>();
         this.pendingDeletes = new LinkedHashSet<>();
         this.relationshipManager = new RelationshipManager(this);
+        this.dirtyManyToMany = Collections.newSetFromMap(new ConcurrentHashMap<>());
+        this.cacheProvider = new NoOpCacheProvider();
+        this.cacheEventSink = new NoOpCacheEventSink();
+        this.cacheTtl = Duration.ofMinutes(5);
         this.transactionActive = false;
         this.migrationManager = null; // Lazy initialized
         this.persistentMigrationManager = null; // Lazy initialized
@@ -219,6 +240,7 @@ public class EntityManager {
         }
 
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+        relationshipManager.prepareRelationships(entity, metadata);
         Object id = metadata.getIdValue(entity);
 
         if (id == null || !isInDatabase(entity, metadata)) {
@@ -248,6 +270,7 @@ public class EntityManager {
         }
 
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+        relationshipManager.prepareRelationships(entity, metadata);
         Object id = metadata.getIdValue(entity);
 
         if (id == null || !isInDatabase(entity, metadata)) {
@@ -267,6 +290,7 @@ public class EntityManager {
             throw new IllegalArgumentException("Cannot remove null entity");
         }
 
+        relationshipManager.unlinkManyToMany(entity, EntityMetadata.of(entity.getClass()));
         pendingDeletes.add(entity);
         pendingInserts.remove(entity);
         pendingUpdates.remove(entity);
@@ -274,7 +298,9 @@ public class EntityManager {
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
         Object id = metadata.getIdValue(entity);
         if (id != null) {
-            identityMap.remove(new EntityKey(entity.getClass(), id));
+            EntityKey key = new EntityKey(entity.getClass(), id);
+            identityMap.remove(key);
+            originalValues.remove(key);
         }
     }
 
@@ -294,12 +320,20 @@ public class EntityManager {
             return cached;
         }
 
+        // Check L2 cache (entity-by-id)
+        EntityMetadata metadata = EntityMetadata.of(entityClass);
+        Optional<EntitySnapshot> snapshot = cacheProvider.get(CacheKey.of(entityClass, id));
+        if (snapshot.isPresent()) {
+            T entity = hydrateFromSnapshot(entityClass, metadata, snapshot.get());
+            return manageLoadedEntity(entity, metadata);
+        }
+
         // Load from database
         T entity = executor.findById(entityClass, id);
-        if (entity != null) {
-            identityMap.put(key, entity);
+        if (entity == null) {
+            return null;
         }
-        return entity;
+        return manageLoadedEntity(entity, metadata);
     }
 
     /**
@@ -315,40 +349,54 @@ public class EntityManager {
         Set<Object> updateSnapshot = new LinkedHashSet<>(pendingUpdates);
         Set<Object> deleteSnapshot = new LinkedHashSet<>(pendingDeletes);
         Map<EntityKey, Object> identityMapSnapshot = new HashMap<>(identityMap);
+        Map<EntityKey, Map<Field, Object>> originalValuesSnapshot = new HashMap<>(originalValues);
+
+        Map<CacheKey, CacheEvent.Operation> cacheEvents = new LinkedHashMap<>();
+        Set<Object> insertedEntities = new LinkedHashSet<>();
 
         try {
             // Process deletes first with cascade remove
-            // Iterate over copy to avoid concurrent modification
-            List<Object> deletesToProcess = new ArrayList<>(pendingDeletes);
-            for (Object entity : deletesToProcess) {
-                EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-                relationshipManager.cascadeRemove(entity, metadata);
-                executor.delete(entity, metadata);
-            }
+            // Use a local queue/drain approach so cascadeRemove can safely add new deletes.
+            Set<Object> processedDeletes = Collections.newSetFromMap(new IdentityHashMap<>());
+            Deque<Object> deleteQueue = new ArrayDeque<>(pendingDeletes);
             pendingDeletes.clear();
 
+            while (!deleteQueue.isEmpty()) {
+                Object entity = deleteQueue.pollFirst();
+                if (entity == null || !processedDeletes.add(entity)) {
+                    continue;
+                }
+
+                EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+                deleteManyToManyJoinRows(entity, metadata);
+                relationshipManager.cascadeRemove(entity, metadata);
+
+                if (!pendingDeletes.isEmpty()) {
+                    deleteQueue.addAll(pendingDeletes);
+                    pendingDeletes.clear();
+                }
+
+                executor.delete(entity, metadata);
+                Object id = metadata.getIdValue(entity);
+                if (id != null) {
+                    recordCacheEvent(cacheEvents, CacheKey.of(entity.getClass(), id), CacheEvent.Operation.DELETE);
+                }
+            }
+
             // Process inserts with cascade persist
-            // Use a local queue/drain approach so cascadePersist can safely add new entities
+            // Use a local drain + dependency ordering so ManyToOne/OneToOne references insert first.
             Deque<Object> insertQueue = new ArrayDeque<>(pendingInserts);
             pendingInserts.clear();
 
+            Set<Object> processedInserts = Collections.newSetFromMap(new IdentityHashMap<>());
+            Set<Object> visitingInserts = Collections.newSetFromMap(new IdentityHashMap<>());
             while (!insertQueue.isEmpty()) {
                 Object entity = insertQueue.pollFirst();
-                EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-
-                // Process cascade persist - this may add more entities to pendingInserts
-                relationshipManager.cascadePersist(entity, metadata);
-
-                // Insert the entity
-                executor.insert(entity, metadata);
-
-                // Add to identity map after insert
-                Object id = metadata.getIdValue(entity);
-                if (id != null) {
-                    identityMap.put(new EntityKey(entity.getClass(), id), entity);
+                if (entity == null) {
+                    continue;
                 }
+                processInsertEntity(entity, processedInserts, visitingInserts, cacheEvents, insertedEntities);
 
-                // Move any newly-added pendingInserts into the queue for processing
                 if (!pendingInserts.isEmpty()) {
                     insertQueue.addAll(pendingInserts);
                     pendingInserts.clear();
@@ -359,9 +407,29 @@ public class EntityManager {
             List<Object> updatesToProcess = new ArrayList<>(pendingUpdates);
             for (Object entity : updatesToProcess) {
                 EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-                executor.update(entity, metadata);
+                Object id = metadata.getIdValue(entity);
+                Map<Field, Object> snapshot = originalValues.get(new EntityKey(entity.getClass(), id));
+                executor.update(entity, metadata, snapshot);
+                if (id != null) {
+                    originalValues.put(new EntityKey(entity.getClass(), id), takeSnapshotValues(entity, metadata));
+                    recordCacheEvent(cacheEvents, CacheKey.of(entity.getClass(), id), CacheEvent.Operation.UPSERT);
+                }
+            }
+            pendingUpdates.clear();
+
+            // Sync ManyToMany join tables after all ids are assigned and updates are applied.
+            for (Object entity : insertedEntities) {
+                if (entity != null) {
+                    syncManyToManyJoinRows(entity, EntityMetadata.of(entity.getClass()), true);
+                }
+            }
+            for (Object entity : updatesToProcess) {
+                if (entity != null) {
+                    syncManyToManyJoinRows(entity, EntityMetadata.of(entity.getClass()), false);
+                }
             }
 
+            publishCacheEvents(cacheEvents);
 
         } catch (Exception e) {
             // Restore pending operations state for retry or inspection
@@ -373,6 +441,8 @@ public class EntityManager {
             pendingDeletes.addAll(deleteSnapshot);
             identityMap.clear();
             identityMap.putAll(identityMapSnapshot);
+            originalValues.clear();
+            originalValues.putAll(originalValuesSnapshot);
 
             // If transaction is active, rollback the database changes
             if (transactionActive) {
@@ -403,6 +473,7 @@ public class EntityManager {
         if (id != null) {
             EntityKey key = new EntityKey(entity.getClass(), id);
             identityMap.remove(key);
+            originalValues.remove(key);
         }
 
         // Handle cascade detach
@@ -445,6 +516,14 @@ public class EntityManager {
         EntityKey key = new EntityKey(entity.getClass(), id);
         identityMap.put(key, entity);
 
+        // Update snapshot after refresh
+        Map<Field, Object> snapshot = new HashMap<>();
+        for (Field field : metadata.getFields()) {
+            if (field.equals(metadata.getIdField())) continue;
+            snapshot.put(field, metadata.getFieldValue(entity, field));
+        }
+        originalValues.put(key, snapshot);
+
         // Handle cascade refresh
         relationshipManager.cascadeRefresh(entity, metadata);
     }
@@ -459,6 +538,7 @@ public class EntityManager {
         }
 
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+        relationshipManager.prepareRelationships(entity, metadata);
         Object id = metadata.getIdValue(entity);
 
         if (id == null) {
@@ -500,6 +580,14 @@ public class EntityManager {
         // Mark for update
         pendingUpdates.add(managedEntity);
 
+        // Take snapshot after merge
+        Map<Field, Object> snapshot = new HashMap<>();
+        for (Field field : metadata.getFields()) {
+            if (field.equals(metadata.getIdField())) continue;
+            snapshot.put(field, metadata.getFieldValue(managedEntity, field));
+        }
+        originalValues.put(key, snapshot);
+
         // Handle cascade merge
         relationshipManager.cascadeMerge(managedEntity, metadata);
 
@@ -514,6 +602,106 @@ public class EntityManager {
         pendingUpdates.clear();
         pendingDeletes.clear();
         identityMap.clear();
+        originalValues.clear();
+    }
+
+    /**
+     * Find all entities of a given type and attach them to this EntityManager.
+     *
+     * Note: this method attaches returned entities into the identity map so repeated reads
+     * return stable instances within a single EntityManager.
+     */
+    public <T> List<T> findAll(Class<T> entityClass) {
+        EntityMetadata metadata = EntityMetadata.of(entityClass);
+        List<T> rows = executor.findAll(entityClass);
+        List<T> managed = new ArrayList<>(rows.size());
+        for (T row : rows) {
+            managed.add(manageLoadedEntity(row, metadata));
+        }
+        return managed;
+    }
+
+    /**
+     * Execute a SELECT query and attach results to this EntityManager.
+     */
+    public <T> List<T> executeSelectQuery(Query query, Class<T> entityClass) {
+        EntityMetadata metadata = EntityMetadata.of(entityClass);
+        List<T> results = new ArrayList<>();
+
+        try (PreparedStatement stmt = executor.getConnection().prepareStatement(query.getSql())) {
+            SqlExecutor.setParameters(stmt, query.getParameters());
+
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    T entity = SqlExecutor.mapResultSetToEntity(rs, metadata);
+                    results.add(manageLoadedEntity(entity, metadata));
+                }
+            }
+            return results;
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to execute query: " + query.getSql() + " params=" + query.getParameters(), e);
+        }
+    }
+
+    /**
+     * Configure an entity snapshot cache (L2 cache) for this EntityManager.
+     */
+    public EntityManager withCacheProvider(CacheProvider cacheProvider) {
+        this.cacheProvider = (cacheProvider != null) ? cacheProvider : new NoOpCacheProvider();
+        return this;
+    }
+
+    public EntityManager withCacheEventSink(CacheEventSink cacheEventSink) {
+        this.cacheEventSink = (cacheEventSink != null) ? cacheEventSink : new NoOpCacheEventSink();
+        return this;
+    }
+
+    public EntityManager withCacheTtl(Duration ttl) {
+        if (ttl == null) {
+            throw new IllegalArgumentException("ttl must not be null");
+        }
+        this.cacheTtl = ttl;
+        return this;
+    }
+
+    void markDirty(Object entity) {
+        if (entity == null) {
+            return;
+        }
+        if (pendingInserts.contains(entity)) {
+            return;
+        }
+
+        EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+        Object id = metadata.getIdValue(entity);
+        if (id == null) {
+            return;
+        }
+        EntityKey key = new EntityKey(entity.getClass(), id);
+        if (!identityMap.containsKey(key)) {
+            return;
+        }
+        pendingUpdates.add(entity);
+    }
+
+    void markManyToManyDirty(Object entity, Field field) {
+        if (entity == null || field == null) {
+            return;
+        }
+        EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+        Object id = metadata.getIdValue(entity);
+        if (id == null) {
+            return;
+        }
+        dirtyManyToMany.add(new ManyToManyDirtyKey(entity.getClass(), id, field.getName()));
+    }
+
+    private boolean isManyToManyDirty(Class<?> entityClass, Object id, Field field) {
+        return dirtyManyToMany.contains(new ManyToManyDirtyKey(entityClass, id, field.getName()));
+    }
+
+    private void clearManyToManyDirty(Class<?> entityClass, Object id, Field field) {
+        dirtyManyToMany.remove(new ManyToManyDirtyKey(entityClass, id, field.getName()));
     }
 
     /**
@@ -758,6 +946,376 @@ public class EntityManager {
      */
     public Dialect getDialect() {
         return dialect;
+    }
+
+    private <T> T manageLoadedEntity(T entity, EntityMetadata metadata) {
+        if (entity == null) {
+            return null;
+        }
+        Object id = metadata.getIdValue(entity);
+        if (id == null) {
+            return entity;
+        }
+
+        EntityKey key = new EntityKey(entity.getClass(), id);
+        @SuppressWarnings("unchecked")
+        T existing = (T) identityMap.get(key);
+        if (existing != null) {
+            return existing;
+        }
+
+        identityMap.put(key, entity);
+        relationshipManager.prepareRelationships(entity, metadata);
+        relationshipManager.hydrateEagerSingleRefs(entity, metadata);
+        originalValues.put(key, takeSnapshotValues(entity, metadata));
+        cacheProvider.put(CacheKey.of(entity.getClass(), id), takeEntitySnapshot(entity, metadata), cacheTtl);
+        return entity;
+    }
+
+    private void publishCacheEvents(Map<CacheKey, CacheEvent.Operation> cacheEvents) {
+        for (Map.Entry<CacheKey, CacheEvent.Operation> entry : cacheEvents.entrySet()) {
+            CacheKey key = entry.getKey();
+            CacheEvent.Operation op = entry.getValue();
+            if (key == null) {
+                continue;
+            }
+            cacheProvider.invalidate(key);
+            cacheEventSink.append(new CacheEvent(op, key));
+        }
+    }
+
+    private static void recordCacheEvent(Map<CacheKey, CacheEvent.Operation> sink, CacheKey key, CacheEvent.Operation op) {
+        if (key == null) {
+            return;
+        }
+        CacheEvent.Operation existing = sink.get(key);
+        if (existing == CacheEvent.Operation.DELETE) {
+            return;
+        }
+        sink.put(key, op);
+    }
+
+    private static EntitySnapshot takeEntitySnapshot(Object entity, EntityMetadata metadata) {
+        Object idObj = metadata.getIdValue(entity);
+        if (idObj == null) {
+            throw new IllegalStateException("Cannot snapshot entity without id: " + entity.getClass().getName());
+        }
+
+        Map<String, Object> values = new HashMap<>();
+        for (Field field : metadata.getFields()) {
+            if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
+                Object related = metadata.getFieldValue(entity, field);
+                if (related == null) {
+                    values.put(field.getName(), null);
+                } else {
+                    EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
+                    values.put(field.getName(), copySnapshotValue(relatedMeta.getIdValue(related)));
+                }
+            } else {
+                Object v = metadata.getFieldValue(entity, field);
+                values.put(field.getName(), copySnapshotValue(v));
+            }
+        }
+
+        return new EntitySnapshot(entity.getClass().getName(), String.valueOf(idObj), values);
+    }
+
+    private static Map<Field, Object> takeSnapshotValues(Object entity, EntityMetadata metadata) {
+        Map<Field, Object> snapshot = new HashMap<>();
+        for (Field field : metadata.getFields()) {
+            if (field.equals(metadata.getIdField())) continue;
+            if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
+                Object related = metadata.getFieldValue(entity, field);
+                if (related == null) {
+                    snapshot.put(field, null);
+                } else {
+                    EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
+                    snapshot.put(field, copySnapshotValue(relatedMeta.getIdValue(related)));
+                }
+            } else {
+                snapshot.put(field, copySnapshotValue(metadata.getFieldValue(entity, field)));
+            }
+        }
+        return snapshot;
+    }
+
+    @SuppressWarnings("IfCanBeSwitch")
+    private static Object copySnapshotValue(Object v) {
+        if (v == null) return null;
+        if (v instanceof java.util.Date d) return new java.util.Date(d.getTime());
+        if (v instanceof java.sql.Date d) return new java.sql.Date(d.getTime());
+        if (v instanceof java.sql.Time t) return new java.sql.Time(t.getTime());
+        if (v instanceof java.sql.Timestamp ts) return new java.sql.Timestamp(ts.getTime());
+        if (v instanceof byte[] bytes) return Arrays.copyOf(bytes, bytes.length);
+        return v;
+    }
+
+    private static <T> T hydrateFromSnapshot(Class<T> entityClass, EntityMetadata metadata, EntitySnapshot snapshot) {
+        if (!entityClass.getName().equals(snapshot.entityClassName())) {
+            throw new IllegalArgumentException("Snapshot entity class mismatch: expected=" + entityClass.getName() + " got=" + snapshot.entityClassName());
+        }
+
+        @SuppressWarnings("unchecked")
+        T entity = (T) metadata.newInstance();
+        for (Field field : metadata.getFields()) {
+            Object v = snapshot.fieldValues().get(field.getName());
+            if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
+                if (v == null) {
+                    metadata.setFieldValue(entity, field, null);
+                } else {
+                    EntityMetadata relatedMeta = EntityMetadata.of(field.getType());
+                    Object related = relatedMeta.newInstance();
+                    Object convertedId = de.t14d3.spool.mapping.TypeMapper.convertToJavaType(v, relatedMeta.getIdField().getType());
+                    relatedMeta.setIdValue(related, convertedId);
+                    metadata.setFieldValue(entity, field, related);
+                }
+                continue;
+            }
+            metadata.setFieldValue(entity, field, copySnapshotValue(v));
+        }
+        return entity;
+    }
+
+    private record ManyToManyJoinTable(String joinTable, String ownerColumn, String inverseColumn, boolean thisIsOwner) {
+        String thisColumn() {
+            return thisIsOwner ? ownerColumn : inverseColumn;
+        }
+
+        String otherColumn() {
+            return thisIsOwner ? inverseColumn : ownerColumn;
+        }
+
+        Object ownerId(Object thisId, Object otherId) {
+            return thisIsOwner ? thisId : otherId;
+        }
+
+        Object inverseId(Object thisId, Object otherId) {
+            return thisIsOwner ? otherId : thisId;
+        }
+    }
+
+    private record ManyToManyDirtyKey(Class<?> entityClass, Object id, String fieldName) {}
+
+    private Set<Object> loadManyToManyOtherIds(ManyToManyJoinTable join, Object thisId, Class<?> otherIdType) {
+        String sql = "SELECT " + dialect.quoteIdentifier(join.otherColumn()) +
+                " FROM " + dialect.quoteIdentifier(join.joinTable()) +
+                " WHERE " + dialect.quoteIdentifier(join.thisColumn()) + " = ?";
+        try (PreparedStatement ps = executor.getConnection().prepareStatement(sql)) {
+            ps.setObject(1, thisId);
+            Set<Object> ids = new LinkedHashSet<>();
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    Object raw = rs.getObject(1);
+                    Object converted = de.t14d3.spool.mapping.TypeMapper.convertToJavaType(raw, otherIdType);
+                    ids.add(converted);
+                }
+            }
+            return ids;
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to load many-to-many join ids from " + join.joinTable(), e);
+        }
+    }
+
+    private void processInsertEntity(
+            Object entity,
+            Set<Object> processed,
+            Set<Object> visiting,
+            Map<CacheKey, CacheEvent.Operation> cacheEvents,
+            Set<Object> insertedEntities
+    ) {
+        if (processed.contains(entity)) {
+            return;
+        }
+        if (!visiting.add(entity)) {
+            throw new IllegalStateException("Cycle detected while inserting entities (check cascading ManyToOne/OneToOne relationships)");
+        }
+
+        EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+        relationshipManager.prepareRelationships(entity, metadata);
+
+        // Ensure referenced entities for single-ref relationships exist first.
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_ONE
+                    && relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_ONE) {
+                continue;
+            }
+
+            Object related = metadata.getFieldValue(entity, relationship.field());
+            if (related == null) {
+                continue;
+            }
+
+            EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
+            Object relatedId = relatedMeta.getIdValue(related);
+            if (relatedId != null) {
+                continue;
+            }
+
+            if (relationship.isCascadable(de.t14d3.spool.annotations.CascadeType.PERSIST)
+                    || relationship.isCascadable(de.t14d3.spool.annotations.CascadeType.ALL)) {
+                persistCascade(related);
+                processInsertEntity(related, processed, visiting, cacheEvents, insertedEntities);
+            } else {
+                throw new IllegalStateException(
+                        "Transient reference on " + entity.getClass().getName() + "." + relationship.field().getName() +
+                                " without cascade persist"
+                );
+            }
+        }
+
+        // Cascade persist for collections and other relationships.
+        relationshipManager.cascadePersist(entity, metadata);
+
+        executor.insert(entity, metadata);
+
+        Object id = metadata.getIdValue(entity);
+        if (id != null) {
+            identityMap.put(new EntityKey(entity.getClass(), id), entity);
+            originalValues.put(new EntityKey(entity.getClass(), id), takeSnapshotValues(entity, metadata));
+            recordCacheEvent(cacheEvents, CacheKey.of(entity.getClass(), id), CacheEvent.Operation.UPSERT);
+            insertedEntities.add(entity);
+        }
+
+        visiting.remove(entity);
+        processed.add(entity);
+    }
+
+    private void deleteManyToManyJoinRows(Object entity, EntityMetadata metadata) {
+        Object thisId = metadata.getIdValue(entity);
+        if (thisId == null) {
+            return;
+        }
+
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+                continue;
+            }
+
+            ManyToManyJoinTable join = resolveManyToManyJoinTable(metadata, relationship);
+            if (join == null) {
+                continue;
+            }
+
+            Query q = Query.deleteFrom(dialect, join.joinTable())
+                    .where(dialect.quoteIdentifier(join.thisColumn()) + " = ?", thisId)
+                    .build();
+            executor.executeUpdate(q.getSql(), q.getParameters());
+        }
+    }
+
+    private void syncManyToManyJoinRows(Object entity, EntityMetadata metadata, boolean forceAll) {
+        Object thisId = metadata.getIdValue(entity);
+        if (thisId == null) {
+            return;
+        }
+
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+                continue;
+            }
+            if (relationship.targetEntity() == Object.class) {
+                continue;
+            }
+
+            ManyToManyJoinTable join = resolveManyToManyJoinTable(metadata, relationship);
+            if (join == null) {
+                continue;
+            }
+
+            boolean shouldSync = forceAll || isManyToManyDirty(entity.getClass(), thisId, relationship.field());
+            if (!shouldSync) {
+                continue;
+            }
+
+            // Desired set from the in-memory collection (load if needed).
+            Object relatedEntities = metadata.getFieldValue(entity, relationship.field());
+            Set<Object> desired = new LinkedHashSet<>();
+            if (relatedEntities instanceof Collection<?> collection) {
+                for (Object related : collection) {
+                    if (related == null) continue;
+                    EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
+                    Object relatedId = relatedMeta.getIdValue(related);
+                    if (relatedId == null) {
+                        throw new IllegalStateException("ManyToMany related entity has no id: " + related.getClass().getName());
+                    }
+                    desired.add(relatedId);
+                }
+            }
+
+            Class<?> otherIdType = EntityMetadata.of(relationship.targetEntity()).getIdField().getType();
+            Set<Object> existing = loadManyToManyOtherIds(join, thisId, otherIdType);
+
+            Set<Object> toAdd = new LinkedHashSet<>(desired);
+            toAdd.removeAll(existing);
+
+            Set<Object> toRemove = new LinkedHashSet<>(existing);
+            toRemove.removeAll(desired);
+
+            for (Object otherId : toRemove) {
+                Query deletePair = Query.deleteFrom(dialect, join.joinTable())
+                        .where(dialect.quoteIdentifier(join.thisColumn()) + " = ? AND " + dialect.quoteIdentifier(join.otherColumn()) + " = ?", thisId, otherId)
+                        .build();
+                executor.executeUpdate(deletePair.getSql(), deletePair.getParameters());
+            }
+
+            for (Object otherId : toAdd) {
+                Object ownerId = join.ownerId(thisId, otherId);
+                Object inverseId = join.inverseId(thisId, otherId);
+                Query insert = Query.insertInto(dialect, join.joinTable())
+                        .columns(join.ownerColumn(), join.inverseColumn())
+                        .values(ownerId, inverseId)
+                        .build();
+                executor.execute(insert.getSql(), insert.getParameters());
+            }
+
+            clearManyToManyDirty(entity.getClass(), thisId, relationship.field());
+        }
+    }
+
+    private ManyToManyJoinTable resolveManyToManyJoinTable(EntityMetadata thisMetadata, de.t14d3.spool.mapping.RelationshipMapping relationship) {
+        Field field = relationship.field();
+        String mappedBy = relationship.mappedBy();
+        boolean thisIsOwner = mappedBy == null || mappedBy.isBlank();
+
+        Class<?> ownerClass;
+        String ownerFieldName;
+        Class<?> inverseClass;
+        if (thisIsOwner) {
+            ownerClass = thisMetadata.getEntityClass();
+            ownerFieldName = field.getName();
+            inverseClass = relationship.targetEntity();
+        } else {
+            ownerClass = relationship.targetEntity();
+            ownerFieldName = mappedBy;
+            inverseClass = thisMetadata.getEntityClass();
+        }
+
+        if (ownerClass == Object.class || inverseClass == Object.class) {
+            return null;
+        }
+
+        EntityMetadata ownerMeta = EntityMetadata.of(ownerClass);
+        EntityMetadata inverseMeta = EntityMetadata.of(inverseClass);
+
+        JoinTable joinTableAnn = null;
+        try {
+            Field ownerField = ownerClass.getDeclaredField(ownerFieldName);
+            joinTableAnn = ownerField.getAnnotation(JoinTable.class);
+        } catch (NoSuchFieldException ignored) {
+            // ignore
+        }
+
+        String joinTable = joinTableAnn != null && !joinTableAnn.name().isBlank()
+                ? joinTableAnn.name()
+                : ownerMeta.getTableName() + "_" + ownerFieldName;
+        String ownerColumn = joinTableAnn != null && !joinTableAnn.joinColumn().isBlank()
+                ? joinTableAnn.joinColumn()
+                : ownerMeta.getTableName() + "_" + ownerMeta.getIdColumnName();
+        String inverseColumn = joinTableAnn != null && !joinTableAnn.inverseJoinColumn().isBlank()
+                ? joinTableAnn.inverseJoinColumn()
+                : inverseMeta.getTableName() + "_" + inverseMeta.getIdColumnName();
+
+        return new ManyToManyJoinTable(joinTable, ownerColumn, inverseColumn, thisIsOwner);
     }
 
     // ========================================================================

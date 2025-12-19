@@ -13,9 +13,9 @@ import java.lang.annotation.Target;
 @Retention(RetentionPolicy.RUNTIME)
 public @interface ManyToMany {
     /**
-     * Whether to fetch the related entities lazily.
+     * Whether to fetch the related entities eagerly.
      */
-    boolean fetch() default true;
+    boolean fetch() default false;
 
     /**
      * Cascade operations to related entities.

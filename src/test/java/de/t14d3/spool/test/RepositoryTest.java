@@ -166,4 +166,22 @@ public class RepositoryTest {
         assertNotNull(foundUser);
         assertEquals("john_doe", foundUser.getUsername());
     }
+
+    @Test
+    void testRepositoryReadsReturnManagedInstances() {
+        User user = new User("managed_user", "managed@example.com");
+        userRepo.save(user);
+        em.flush();
+
+        User byId = userRepo.findById(user.getId());
+        assertNotNull(byId);
+
+        List<User> all = userRepo.findAll();
+        assertEquals(1, all.size());
+        assertSame(byId, all.get(0));
+
+        List<User> byUsername = userRepo.findBy("username", "managed_user");
+        assertEquals(1, byUsername.size());
+        assertSame(byId, byUsername.get(0));
+    }
 }

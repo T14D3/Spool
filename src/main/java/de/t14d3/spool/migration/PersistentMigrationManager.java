@@ -258,6 +258,11 @@ public class PersistentMigrationManager {
             TableDefinition table = introspector.buildTableDefinitionFromEntity(entityClass);
             expectedSchema.put(table.getName().toLowerCase(), table);
         }
+        for (Class<?> entityClass : entityClasses) {
+            for (TableDefinition join : introspector.buildJoinTableDefinitionsFromEntity(entityClass)) {
+                expectedSchema.putIfAbsent(join.getName().toLowerCase(), join);
+            }
+        }
 
         Map<String, TableDefinition> actualSchema = new LinkedHashMap<>();
         for (String tableName : expectedSchema.keySet()) {

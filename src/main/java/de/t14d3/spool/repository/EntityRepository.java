@@ -1,15 +1,10 @@
 package de.t14d3.spool.repository;
 
 import de.t14d3.spool.core.EntityManager;
-import de.t14d3.spool.core.SqlExecutor;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.query.Query;
 
 import java.lang.reflect.Field;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -74,7 +69,7 @@ public class EntityRepository<T> {
      * @return a list containing all entities of this type
      */
     public List<T> findAll() {
-        return entityManager.getExecutor().findAll(entityClass);
+        return entityManager.findAll(entityClass);
     }
 
     /**
@@ -265,20 +260,6 @@ public class EntityRepository<T> {
      * @return list of mapped entities
      */
     private List<T> executeSelectQuery(Query query) {
-        SqlExecutor executor = entityManager.getExecutor();
-        List<T> results = new ArrayList<>();
-
-        try (PreparedStatement stmt = executor.getConnection().prepareStatement(query.getSql())) {
-            SqlExecutor.setParameters(stmt, query.getParameters());
-
-            try (ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    results.add(SqlExecutor.mapResultSetToEntity(rs, metadata));
-                }
-            }
-            return results;
-        } catch (SQLException e) {
-            throw new RuntimeException("Failed to execute query: " + query.getSql() + " params=" + query.getParameters(), e);
-        }
+        return entityManager.executeSelectQuery(query, entityClass);
     }
 }

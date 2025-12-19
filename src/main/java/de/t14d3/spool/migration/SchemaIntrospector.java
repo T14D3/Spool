@@ -4,12 +4,16 @@ package de.t14d3.spool.migration;
 
 import de.t14d3.spool.annotations.Column;
 import de.t14d3.spool.annotations.Id;
+import de.t14d3.spool.annotations.JoinTable;
+import de.t14d3.spool.annotations.ManyToMany;
 import de.t14d3.spool.annotations.ManyToOne;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.mapping.TypeMapper;
 import de.t14d3.spool.query.Dialect;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.sql.*;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -394,21 +398,22 @@ public class SchemaIntrospector {
             // Handle @ManyToOne - foreign key columns
             if (field.isAnnotationPresent(ManyToOne.class)) {
                 ManyToOne manyToOne = field.getAnnotation(ManyToOne.class);
-                // Foreign key is typically the ID type of the related entity; fall back to BIGINT
-                sqlType = "BIGINT";
-                nullable = true;
-                
-                // Determine referenced table and column
+                // Foreign key type should match the referenced entity's ID type.
+                // Default nullability follows the relationship's optional flag.
+                nullable = manyToOne.optional();
+
                 // Determine referenced table and column from field type
                 Class<?> targetEntityClass = field.getType();
                 if (targetEntityClass != null) {
                     EntityMetadata targetMetadata = EntityMetadata.of(targetEntityClass);
                     referencedTable = targetMetadata.getTableName();
                     referencedColumn = targetMetadata.getIdColumnName();
+                    sqlType = TypeMapper.javaTypeToSqlType(targetMetadata.getIdField().getType());
                 } else {
                     // Fallback to field name convention
                     referencedTable = field.getType().getSimpleName().toLowerCase();
                     referencedColumn = "id";
+                    sqlType = "BIGINT";
                 }
 
             }
@@ -431,6 +436,94 @@ public class SchemaIntrospector {
         }
 
         return table;
+    }
+
+    /**
+     * Build additional TableDefinitions for ManyToMany join tables.
+     *
+     * Convention:
+     * - join table name: {@code <ownerTable>_<ownerFieldName>}
+     * - join columns: {@code <ownerTable>_<ownerIdColumn>} and {@code <inverseTable>_<inverseIdColumn>}
+     * - composite primary key across both join columns
+     *
+     * Only the owning side (mappedBy empty) creates a join table.
+     */
+    public List<TableDefinition> buildJoinTableDefinitionsFromEntity(Class<?> entityClass) {
+        EntityMetadata ownerMetadata = EntityMetadata.of(entityClass);
+        List<TableDefinition> joinTables = new ArrayList<>();
+
+        for (Field field : entityClass.getDeclaredFields()) {
+            if (!field.isAnnotationPresent(ManyToMany.class)) {
+                continue;
+            }
+            ManyToMany manyToMany = field.getAnnotation(ManyToMany.class);
+            if (manyToMany.mappedBy() != null && !manyToMany.mappedBy().isBlank()) {
+                // Inverse side
+                continue;
+            }
+
+            Class<?> targetEntity = resolveCollectionElementType(field);
+            if (targetEntity == Object.class) {
+                continue;
+            }
+
+            EntityMetadata inverseMetadata = EntityMetadata.of(targetEntity);
+
+            JoinTable joinTable = field.getAnnotation(JoinTable.class);
+            String joinTableName = joinTable != null && !joinTable.name().isBlank()
+                    ? joinTable.name()
+                    : ownerMetadata.getTableName() + "_" + field.getName();
+            String ownerJoinColumn = joinTable != null && !joinTable.joinColumn().isBlank()
+                    ? joinTable.joinColumn()
+                    : ownerMetadata.getTableName() + "_" + ownerMetadata.getIdColumnName();
+            String inverseJoinColumn = joinTable != null && !joinTable.inverseJoinColumn().isBlank()
+                    ? joinTable.inverseJoinColumn()
+                    : inverseMetadata.getTableName() + "_" + inverseMetadata.getIdColumnName();
+
+            String ownerIdSqlType = TypeMapper.javaTypeToSqlType(ownerMetadata.getIdField().getType());
+            String inverseIdSqlType = TypeMapper.javaTypeToSqlType(inverseMetadata.getIdField().getType());
+
+            TableDefinition join = new TableDefinition(joinTableName);
+            join.addColumn(new ColumnDefinition.Builder()
+                    .name(ownerJoinColumn)
+                    .sqlType(ownerIdSqlType)
+                    .nullable(false)
+                    .primaryKey(true)
+                    .referencedTable(ownerMetadata.getTableName())
+                    .referencedColumn(ownerMetadata.getIdColumnName())
+                    .build());
+            join.addColumn(new ColumnDefinition.Builder()
+                    .name(inverseJoinColumn)
+                    .sqlType(inverseIdSqlType)
+                    .nullable(false)
+                    .primaryKey(true)
+                    .referencedTable(inverseMetadata.getTableName())
+                    .referencedColumn(inverseMetadata.getIdColumnName())
+                    .build());
+
+            joinTables.add(join);
+        }
+
+        return joinTables;
+    }
+
+    private static Class<?> resolveCollectionElementType(Field field) {
+        Type t = field.getGenericType();
+        if (!(t instanceof ParameterizedType pt)) {
+            return Object.class;
+        }
+        Type[] args = pt.getActualTypeArguments();
+        if (args.length != 1) {
+            return Object.class;
+        }
+        Type arg = args[0];
+        if (arg instanceof Class<?> c) {
+            return c;
+        }
+        if (arg instanceof ParameterizedType apt && apt.getRawType() instanceof Class<?> c) {
+            return c;
+        }
+        return Object.class;
     }
 
 
