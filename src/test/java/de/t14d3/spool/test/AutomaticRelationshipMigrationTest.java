@@ -123,10 +123,10 @@ public class AutomaticRelationshipMigrationTest {
 
         // Should have at least one CREATE TABLE statement for books with foreign key
         boolean foundBooksCreateWithFk = sqlStatements.stream()
-            .anyMatch(sql -> sql.contains("CREATE TABLE") && 
+            .anyMatch(sql -> sql.contains("CREATE TABLE") &&
                              (sql.contains("books") || sql.contains("BOOKS")) &&
                              sql.contains("FOREIGN KEY") &&
-                             sql.contains("author_id"));
+                             sql.toLowerCase().contains("author_id"));
 
         assertTrue(foundBooksCreateWithFk, "Should generate CREATE TABLE for books with foreign key constraint");
         System.out.println("✓ Migration SQL includes foreign key constraints");

@@ -17,6 +17,10 @@ public class SqlGenerator {
         this.dialect = dialect;
     }
 
+    private String q(String identifier) {
+        return dialect.quoteIdentifier(identifier);
+    }
+
     /**
      * Generate SQL statements for all changes in a SchemaDiff.
      */
@@ -53,7 +57,7 @@ public class SqlGenerator {
      */
     private String generateCreateTable(TableDefinition table) {
         StringBuilder sql = new StringBuilder();
-        sql.append("CREATE TABLE IF NOT EXISTS ").append(table.getName()).append(" (\n");
+        sql.append("CREATE TABLE IF NOT EXISTS ").append(q(table.getName())).append(" (\n");
 
         List<String> columnDefs = new ArrayList<>();
         List<String> primaryKeys = new ArrayList<>();
@@ -61,13 +65,13 @@ public class SqlGenerator {
 
         for (ColumnDefinition column : table.getColumns().values()) {
             StringBuilder colDef = new StringBuilder();
-            colDef.append("  ").append(column.getName()).append(" ");
+            colDef.append("  ").append(q(column.getName())).append(" ");
             colDef.append(getColumnTypeDefinition(column));
 
             if (column.isPrimaryKey()) {
-                primaryKeys.add(column.getName());
+                primaryKeys.add(q(column.getName()));
                 if (column.isAutoIncrement()) {
-                    colDef.append(" ").append(getAutoIncrementKeyword());
+                    colDef.append(" ").append(getAutoIncrementKeyword());       
                 }
             }
 
@@ -93,7 +97,7 @@ public class SqlGenerator {
         for (ColumnDefinition column : table.getColumns().values()) {
             if (column.isForeignKey()) {
                 String constraint = String.format("  FOREIGN KEY (%s) REFERENCES %s(%s)",
-                    column.getName(), column.getReferencedTable(), column.getReferencedColumn());
+                    q(column.getName()), q(column.getReferencedTable()), q(column.getReferencedColumn()));
                 foreignKeyConstraints.add(constraint);
             }
         }
@@ -112,7 +116,7 @@ public class SqlGenerator {
      * Generate DROP TABLE statement.
      */
     private String generateDropTable(String tableName) {
-        return "DROP TABLE IF EXISTS " + tableName;
+        return "DROP TABLE IF EXISTS " + q(tableName);
     }
 
     /**
@@ -120,8 +124,8 @@ public class SqlGenerator {
      */
     private String generateAddColumn(String tableName, ColumnDefinition column) {
         StringBuilder sql = new StringBuilder();
-        sql.append("ALTER TABLE ").append(tableName);
-        sql.append(" ADD COLUMN ").append(column.getName()).append(" ");
+        sql.append("ALTER TABLE ").append(q(tableName));
+        sql.append(" ADD COLUMN ").append(q(column.getName())).append(" ");   
         sql.append(getColumnTypeDefinition(column));
 
         if (!column.isNullable()) {
@@ -144,7 +148,7 @@ public class SqlGenerator {
             return "-- SQLite does not support DROP COLUMN. Manual migration required for: " +
                     tableName + "." + column.getName();
         }
-        return "ALTER TABLE " + tableName + " DROP COLUMN " + column.getName();
+        return "ALTER TABLE " + q(tableName) + " DROP COLUMN " + q(column.getName());
     }
 
     /**
@@ -152,20 +156,20 @@ public class SqlGenerator {
      */
     private String generateModifyColumn(String tableName, ColumnDefinition newColumn, ColumnDefinition oldColumn) {
         StringBuilder sql = new StringBuilder();
-        sql.append("ALTER TABLE ").append(tableName);
+        sql.append("ALTER TABLE ").append(q(tableName));
 
         switch (dialect) {
             case MYSQL:
-                sql.append(" MODIFY COLUMN ").append(newColumn.getName()).append(" ");
+                sql.append(" MODIFY COLUMN ").append(q(newColumn.getName())).append(" ");
                 break;
             case POSTGRESQL:
-                sql.append(" ALTER COLUMN ").append(newColumn.getName()).append(" TYPE ");
+                sql.append(" ALTER COLUMN ").append(q(newColumn.getName())).append(" TYPE ");
                 break;
             case SQLITE:
                 return "-- SQLite does not support ALTER COLUMN. Manual migration required for: " +
                         tableName + "." + newColumn.getName();
             default:
-                sql.append(" ALTER COLUMN ").append(newColumn.getName()).append(" ");
+                sql.append(" ALTER COLUMN ").append(q(newColumn.getName())).append(" ");
         }
 
         sql.append(getColumnTypeDefinition(newColumn));
@@ -173,8 +177,8 @@ public class SqlGenerator {
         if (!newColumn.isNullable()) {
             if (dialect == Dialect.POSTGRESQL) {
                 // PostgreSQL needs separate statement for NOT NULL
-                return sql.toString() + ";\nALTER TABLE " + tableName +
-                        " ALTER COLUMN " + newColumn.getName() + " SET NOT NULL";
+                return sql.toString() + ";\nALTER TABLE " + q(tableName) +
+                        " ALTER COLUMN " + q(newColumn.getName()) + " SET NOT NULL";
             }
             sql.append(" NOT NULL");
         }
