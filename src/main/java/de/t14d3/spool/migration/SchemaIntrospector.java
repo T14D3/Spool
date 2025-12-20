@@ -369,11 +369,12 @@ public class SchemaIntrospector {
             boolean isAutoIncrement = isPrimaryKey && metadata.isAutoIncrement();
 
             // Determine SQL type from Java type
-            String sqlType = TypeMapper.javaTypeToSqlType(field.getType());
+            String sqlType = TypeMapper.javaTypeToSqlType(field.getType());     
             Integer length = null;
             boolean nullable = true;
             String referencedTable = null;
             String referencedColumn = null;
+            Class<?> lengthSourceType = field.getType();
 
             // Check for @Column annotation
             if (field.isAnnotationPresent(Column.class)) {
@@ -386,7 +387,7 @@ public class SchemaIntrospector {
                     sqlType = explicitType;
                 }
 
-                if (field.getType() == String.class) {
+                if (field.getType() == String.class || field.getType() == UUID.class) {
                     length = columnAnnotation.length();
                 }
             }
@@ -415,13 +416,28 @@ public class SchemaIntrospector {
                         // Best-effort: resolve referenced column Java type to set FK type consistently.
                         Field referencedField = targetMetadata.getField(referencedColumn);
                         if (referencedField != null) {
+                            lengthSourceType = referencedField.getType();
+                            if ((lengthSourceType == String.class || lengthSourceType == UUID.class)
+                                    && referencedField.isAnnotationPresent(Column.class)) {
+                                length = referencedField.getAnnotation(Column.class).length();
+                            }
                             sqlType = TypeMapper.javaTypeToSqlType(referencedField.getType());
                         } else {
                             // Fallback to id type if we can't resolve the column name.
+                            lengthSourceType = targetMetadata.getIdField().getType();
+                            if ((lengthSourceType == String.class || lengthSourceType == UUID.class)
+                                    && targetMetadata.getIdField().isAnnotationPresent(Column.class)) {
+                                length = targetMetadata.getIdField().getAnnotation(Column.class).length();
+                            }
                             sqlType = TypeMapper.javaTypeToSqlType(targetMetadata.getIdField().getType());
                         }
                     } else {
                         referencedColumn = targetMetadata.getIdColumnName();
+                        lengthSourceType = targetMetadata.getIdField().getType();
+                        if ((lengthSourceType == String.class || lengthSourceType == UUID.class)
+                                && targetMetadata.getIdField().isAnnotationPresent(Column.class)) {
+                            length = targetMetadata.getIdField().getAnnotation(Column.class).length();
+                        }
                         sqlType = TypeMapper.javaTypeToSqlType(targetMetadata.getIdField().getType());
                     }
                 } else {
@@ -431,6 +447,17 @@ public class SchemaIntrospector {
                     sqlType = "BIGINT";
                 }
 
+            }
+
+            if (dialect == Dialect.MYSQL && sqlType != null && sqlType.equalsIgnoreCase("VARCHAR")) {
+                if (lengthSourceType == UUID.class) {
+                    // @Column's default length is 255, but UUID-as-string is 36 chars.
+                    if (length == null || length == 255) {
+                        length = 36;
+                    }
+                } else if (length == null) {
+                    length = defaultVarcharLengthFor(lengthSourceType);
+                }
             }
 
             ColumnDefinition.Builder builder = new ColumnDefinition.Builder()
@@ -498,10 +525,38 @@ public class SchemaIntrospector {
             String ownerIdSqlType = TypeMapper.javaTypeToSqlType(ownerMetadata.getIdField().getType());
             String inverseIdSqlType = TypeMapper.javaTypeToSqlType(inverseMetadata.getIdField().getType());
 
+            Integer ownerIdLength = null;
+            if (dialect == Dialect.MYSQL && ownerIdSqlType != null && ownerIdSqlType.equalsIgnoreCase("VARCHAR")) {
+                ownerIdLength = ownerMetadata.getIdField().isAnnotationPresent(Column.class)
+                        ? ownerMetadata.getIdField().getAnnotation(Column.class).length()
+                        : null;
+                if (ownerMetadata.getIdField().getType() == UUID.class) {
+                    if (ownerIdLength == null || ownerIdLength == 255) {
+                        ownerIdLength = 36;
+                    }
+                } else if (ownerIdLength == null) {
+                    ownerIdLength = defaultVarcharLengthFor(ownerMetadata.getIdField().getType());
+                }
+            }
+            Integer inverseIdLength = null;
+            if (dialect == Dialect.MYSQL && inverseIdSqlType != null && inverseIdSqlType.equalsIgnoreCase("VARCHAR")) {
+                inverseIdLength = inverseMetadata.getIdField().isAnnotationPresent(Column.class)
+                        ? inverseMetadata.getIdField().getAnnotation(Column.class).length()
+                        : null;
+                if (inverseMetadata.getIdField().getType() == UUID.class) {
+                    if (inverseIdLength == null || inverseIdLength == 255) {
+                        inverseIdLength = 36;
+                    }
+                } else if (inverseIdLength == null) {
+                    inverseIdLength = defaultVarcharLengthFor(inverseMetadata.getIdField().getType());
+                }
+            }
+
             TableDefinition join = new TableDefinition(joinTableName);
             join.addColumn(new ColumnDefinition.Builder()
                     .name(ownerJoinColumn)
                     .sqlType(ownerIdSqlType)
+                    .length(ownerIdLength)
                     .nullable(false)
                     .primaryKey(true)
                     .referencedTable(ownerMetadata.getTableName())
@@ -510,6 +565,7 @@ public class SchemaIntrospector {
             join.addColumn(new ColumnDefinition.Builder()
                     .name(inverseJoinColumn)
                     .sqlType(inverseIdSqlType)
+                    .length(inverseIdLength)
                     .nullable(false)
                     .primaryKey(true)
                     .referencedTable(inverseMetadata.getTableName())
@@ -545,6 +601,13 @@ public class SchemaIntrospector {
     // -----------------------
     // Type mapping helpers
     // -----------------------
+
+    private Integer defaultVarcharLengthFor(Class<?> javaType) {
+        if (javaType == UUID.class) return 36;
+        // MySQL requires a length for VARCHAR; 255 is a sensible default for free-form strings.
+        if (javaType == String.class) return 255;
+        return 255;
+    }
 
 
     private int parseLengthFromType(String type) {

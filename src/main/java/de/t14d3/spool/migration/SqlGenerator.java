@@ -193,6 +193,18 @@ public class SqlGenerator {
             type = mapToSqliteType(type);
         }
 
+        // MySQL requires a length for VARCHAR. Provide a sensible default when
+        // the entity definition didn't specify one.
+        if (dialect == Dialect.MYSQL && column.getLength() == null && type != null) {
+            if (type.equalsIgnoreCase("VARCHAR")) {
+                return "VARCHAR(255)";
+            }
+            // CHAR defaults to 1 in MySQL, but be explicit for consistency.
+            if (type.equalsIgnoreCase("CHAR")) {
+                return "CHAR(1)";
+            }
+        }
+
         // Add length for VARCHAR types
         if (column.getLength() != null &&
                 (type.equalsIgnoreCase("VARCHAR") || type.equalsIgnoreCase("CHAR"))) {
