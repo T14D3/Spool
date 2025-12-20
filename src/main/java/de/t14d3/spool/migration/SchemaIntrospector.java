@@ -5,6 +5,7 @@ package de.t14d3.spool.migration;
 import de.t14d3.spool.annotations.Column;
 import de.t14d3.spool.annotations.Id;
 import de.t14d3.spool.annotations.JoinTable;
+import de.t14d3.spool.annotations.JoinColumn;
 import de.t14d3.spool.annotations.ManyToMany;
 import de.t14d3.spool.annotations.ManyToOne;
 import de.t14d3.spool.mapping.EntityMetadata;
@@ -407,8 +408,22 @@ public class SchemaIntrospector {
                 if (targetEntityClass != null) {
                     EntityMetadata targetMetadata = EntityMetadata.of(targetEntityClass);
                     referencedTable = targetMetadata.getTableName();
-                    referencedColumn = targetMetadata.getIdColumnName();
-                    sqlType = TypeMapper.javaTypeToSqlType(targetMetadata.getIdField().getType());
+
+                    JoinColumn joinColumn = field.getAnnotation(JoinColumn.class);
+                    if (joinColumn != null && joinColumn.referencedColumnName() != null && !joinColumn.referencedColumnName().isBlank()) {
+                        referencedColumn = joinColumn.referencedColumnName();
+                        // Best-effort: resolve referenced column Java type to set FK type consistently.
+                        Field referencedField = targetMetadata.getField(referencedColumn);
+                        if (referencedField != null) {
+                            sqlType = TypeMapper.javaTypeToSqlType(referencedField.getType());
+                        } else {
+                            // Fallback to id type if we can't resolve the column name.
+                            sqlType = TypeMapper.javaTypeToSqlType(targetMetadata.getIdField().getType());
+                        }
+                    } else {
+                        referencedColumn = targetMetadata.getIdColumnName();
+                        sqlType = TypeMapper.javaTypeToSqlType(targetMetadata.getIdField().getType());
+                    }
                 } else {
                     // Fallback to field name convention
                     referencedTable = field.getType().getSimpleName().toLowerCase();

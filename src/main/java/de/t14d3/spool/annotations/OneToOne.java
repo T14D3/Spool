@@ -12,9 +12,9 @@ import java.lang.annotation.Target;
 @Retention(RetentionPolicy.RUNTIME)
 public @interface OneToOne {
     /**
-     * Whether to fetch the related entity lazily.
+     * Fetch strategy for the related entity.
      */
-    boolean fetch() default true;
+    FetchType fetch() default FetchType.EAGER;
 
     /**
      * Cascade operations to the related entity.

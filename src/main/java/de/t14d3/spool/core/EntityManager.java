@@ -967,6 +967,7 @@ public class EntityManager {
         identityMap.put(key, entity);
         relationshipManager.prepareRelationships(entity, metadata);
         relationshipManager.hydrateEagerSingleRefs(entity, metadata);
+        relationshipManager.hydrateEagerCollections(entity, metadata);
         originalValues.put(key, takeSnapshotValues(entity, metadata));
         cacheProvider.put(CacheKey.of(entity.getClass(), id), takeEntitySnapshot(entity, metadata), cacheTtl);
         return entity;

@@ -3,6 +3,7 @@ package de.t14d3.spool.mapping;
 import de.t14d3.spool.annotations.Column;
 import de.t14d3.spool.annotations.Entity;
 import de.t14d3.spool.annotations.Id;
+import de.t14d3.spool.annotations.JoinColumn;
 import de.t14d3.spool.annotations.OneToMany;
 import de.t14d3.spool.annotations.Table;
 
@@ -88,8 +89,11 @@ public class EntityMetadata {
             } else if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
                 // Treat @ManyToOne fields as foreign key columns
                 fields.add(field);
-                // Convention: {fieldName}_id
-                String columnName = field.getName() + "_id";
+                JoinColumn joinColumn = field.getAnnotation(JoinColumn.class);
+                // Convention: {fieldName}_id (overridable via @JoinColumn(name="..."))
+                String columnName = (joinColumn != null && joinColumn.name() != null && !joinColumn.name().isBlank())
+                        ? joinColumn.name()
+                        : field.getName() + "_id";
                 columnToField.put(columnName, field);
                 fieldToColumn.put(field, columnName);
             } else if (field.isAnnotationPresent(OneToMany.class)) {

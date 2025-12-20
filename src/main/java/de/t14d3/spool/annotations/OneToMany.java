@@ -26,9 +26,9 @@ public @interface OneToMany {
     String mappedBy();
 
     /**
-     * Whether to fetch the related entities lazily.
+     * Fetch strategy for the related entities.
      */
-    boolean fetch() default true;
+    FetchType fetch() default FetchType.EAGER;
 
     /**
      * Cascade operations to related entities.

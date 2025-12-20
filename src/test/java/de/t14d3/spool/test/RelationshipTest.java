@@ -110,8 +110,18 @@ public class RelationshipTest {
         assertEquals("George Orwell", loadedAuthor.getName());
         assertEquals("orwell@example.com", loadedAuthor.getEmail());
 
-        // For now, books relationship is not auto-loaded (would need lazy loading)
-        // But we can verify the author was properly assigned to books
+        // Books relationship is eager-loaded via OneToMany(fetch=EAGER default).
+        assertNotNull(loadedAuthor.getBooks());
+        assertEquals(2, loadedAuthor.getBooks().size());
+
+        // Verify back-references are maintained and ManyToOne is eager-hydrated.
+        for (Book b : loadedAuthor.getBooks()) {
+            assertNotNull(b.getId());
+            assertNotNull(b.getAuthor());
+            assertEquals(loadedAuthor.getId(), b.getAuthor().getId());
+        }
+
+        // Verify books also exist in DB
         Book loadedBook1 = bookRepo.findByTitle("1984").get(0);
         Book loadedBook2 = bookRepo.findByTitle("Animal Farm").get(0);
 
@@ -120,8 +130,6 @@ public class RelationshipTest {
         assertEquals("1984", loadedBook1.getTitle());
         assertEquals("Animal Farm", loadedBook2.getTitle());
 
-        // Note: author relationship needs manual loading for now
-        // In full implementation, this would use lazy loading
         System.out.println("✓ Author and books loaded successfully");
         System.out.println("✓ Books maintain their titles and relationships");
     }

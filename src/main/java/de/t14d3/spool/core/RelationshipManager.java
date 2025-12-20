@@ -1,9 +1,11 @@
 package de.t14d3.spool.core;
 
 import de.t14d3.spool.annotations.CascadeType;
+import de.t14d3.spool.annotations.FetchType;
 import de.t14d3.spool.annotations.OneToMany;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.mapping.RelationshipMapping;
+import de.t14d3.spool.query.Query;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.ParameterizedType;
@@ -376,9 +378,9 @@ public class RelationshipManager {
     }
 
     /**
-     * Eagerly hydrate single-reference relationships (ManyToOne/OneToOne) when configured with fetch=true.
+     * Eagerly hydrate single-reference relationships (ManyToOne/OneToOne) when configured with fetch=EAGER.
      *
-     * This intentionally does not attempt to make single refs lazy; if fetch=false the reference remains
+     * This intentionally does not attempt to make single refs lazy; if fetch=LAZY the reference remains
      * a stub (id-only) created by row mapping or user code.
      */
     public void hydrateEagerSingleRefs(Object entity, EntityMetadata metadata) {
@@ -391,7 +393,7 @@ public class RelationshipManager {
                     && relationship.relationshipType() != RelationshipMapping.RelationshipType.ONE_TO_ONE) {
                 continue;
             }
-            if (!relationship.fetch()) {
+            if (relationship.fetch() != FetchType.EAGER) {
                 continue;
             }
 
@@ -409,6 +411,67 @@ public class RelationshipManager {
             Object managed = entityManager.find(related.getClass(), relatedId);
             if (managed != null && managed != related) {
                 setFieldValue(entity, relationship.field(), managed);
+            }
+        }
+    }
+
+    /**
+     * Eagerly hydrate collection relationships (currently OneToMany) when configured with fetch=EAGER.
+     * <p>
+     * This runs a SELECT on the target table using the {@code mappedBy} foreign-key column and
+     * populates the owner's collection. It also sets the back-reference on the child objects.
+     */
+    public void hydrateEagerCollections(Object entity, EntityMetadata metadata) {
+        if (entity == null) {
+            return;
+        }
+
+        for (RelationshipMapping relationship : getRelationships(metadata)) {
+            if (relationship.relationshipType() != RelationshipMapping.RelationshipType.ONE_TO_MANY) {
+                continue;
+            }
+            if (relationship.fetch() != FetchType.EAGER) {
+                continue;
+            }
+            if (relationship.mappedBy() == null || relationship.mappedBy().isBlank()) {
+                continue;
+            }
+
+            Object ownerId = metadata.getIdValue(entity);
+            if (ownerId == null) {
+                continue;
+            }
+
+            Class<?> targetEntity = relationship.targetEntity();
+            EntityMetadata targetMeta = EntityMetadata.of(targetEntity);
+
+            Field mappedByField = findField(targetEntity, relationship.mappedBy());
+            if (mappedByField == null) {
+                throw new IllegalStateException("OneToMany mappedBy field not found: " + targetEntity.getName() + "." + relationship.mappedBy());
+            }
+
+            String fkColumn = targetMeta.getColumnName(mappedByField);
+            if (fkColumn == null || fkColumn.isBlank()) {
+                throw new IllegalStateException("OneToMany mappedBy field is not column-mapped: " + targetEntity.getName() + "." + relationship.mappedBy());
+            }
+
+            Query q = Query.select(entityManager.getDialect(), "*")
+                    .from(targetMeta.getTableName())
+                    .where(entityManager.getDialect().quoteIdentifier(fkColumn) + " = ?", ownerId)
+                    .build();
+
+            @SuppressWarnings("unchecked")
+            List<Object> children = (List<Object>) (List<?>) entityManager.executeSelectQuery(q, targetEntity);
+
+            Collection<Object> ownerCollection = getOrCreateCollection(entity, relationship.field());
+            ownerCollection.clear();
+            ownerCollection.addAll(children);
+
+            for (Object child : children) {
+                if (child == null) {
+                    continue;
+                }
+                setFieldValue(child, mappedByField, entity);
             }
         }
     }
