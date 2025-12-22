@@ -2,10 +2,11 @@ plugins {
     id("java")
     `java-library`
     application
+    `maven-publish`
 }
 
 group = "de.t14d3"
-version = "1.1-SNAPSHOT"
+version = "1.2-SNAPSHOT"
 
 application {
     mainClass.set("de.t14d3.spool.Main")
