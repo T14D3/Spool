@@ -15,6 +15,7 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 
 /**
  * Executes SQL queries and maps results to entities.
@@ -305,6 +306,7 @@ public class SqlExecutor {
                 case Date date -> stmt.setTimestamp(idx, new Timestamp(date.getTime()));
                 case LocalDate localDate -> stmt.setDate(idx, java.sql.Date.valueOf(localDate));
                 case LocalDateTime localDateTime -> stmt.setTimestamp(idx, Timestamp.valueOf(localDateTime));
+                case UUID uuid -> stmt.setString(idx, uuid.toString());
                 case Enum<?> anEnum -> stmt.setString(idx, anEnum.name());
                 default ->
                     // fallback - let JDBC try to handle it

@@ -477,9 +477,84 @@ public class RelationshipManager {
     }
 
     /**
-     * Remove ManyToMany links from both sides (used when deleting an entity).
+     * Eagerly hydrate ManyToMany relationships when configured with fetch=EAGER.
+     * <p>
+     * To avoid large inverse graphs and recursive hydration loops, this only hydrates the owning side.
+     * Inverse collections are synchronized in-memory for the loaded entities.
      */
-    public void unlinkManyToMany(Object entity, EntityMetadata metadata) {
+    public void hydrateEagerManyToMany(Object entity, EntityMetadata metadata) {
+        if (entity == null) {
+            return;
+        }
+
+        Object thisId = metadata.getIdValue(entity);
+        if (thisId == null) {
+            return;
+        }
+
+        for (RelationshipMapping relationship : getRelationships(metadata)) {
+            if (relationship.relationshipType() != RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+                continue;
+            }
+            if (relationship.fetch() != FetchType.EAGER) {
+                continue;
+            }
+            if (relationship.targetEntity() == Object.class) {
+                continue;
+            }
+            if (relationship.mappedBy() != null && !relationship.mappedBy().isBlank()) {
+                // Skip inverse side hydration (see method Javadoc).
+                continue;
+            }
+
+            EntityManager.ManyToManyJoinTable join = entityManager.resolveManyToManyJoinTable(metadata, relationship);
+            if (join == null) {
+                continue;
+            }
+
+            EntityMetadata otherMeta = EntityMetadata.of(relationship.targetEntity());
+            Class<?> otherIdType = otherMeta.getIdField().getType();
+            Set<Object> otherIds = entityManager.loadManyToManyOtherIds(join, thisId, otherIdType);
+
+            List<Object> relatedEntities = new ArrayList<>();
+            for (Object otherId : otherIds) {
+                Object related = entityManager.find(relationship.targetEntity(), otherId);
+                if (related != null) {
+                    relatedEntities.add(related);
+                }
+            }
+
+            Field ownerField = relationship.field();
+            Collection<Object> ownerCollection = getOrCreateCollection(entity, ownerField);
+            withoutBidirectionalSync(() -> {
+                ownerCollection.clear();
+                ownerCollection.addAll(relatedEntities);
+            });
+
+            Field inverseField = resolveManyToManyInverseField(
+                metadata.getEntityClass(),
+                ownerField,
+                relationship.targetEntity(),
+                relationship.mappedBy()
+            );
+            if (inverseField == null) {
+                continue;
+            }
+
+            for (Object related : relatedEntities) {
+                if (related == null) {
+                    continue;
+                }
+                wrapManyToManyCollection(related, inverseField, ownerField);
+                ensureInverseContains(entity, related, inverseField);
+            }
+        }
+    }
+
+    /**
+     * Remove ManyToMany links from both sides (used when deleting an entity).  
+     */
+    public void unlinkManyToMany(Object entity, EntityMetadata metadata) {      
         if (entity == null) {
             return;
         }

@@ -512,6 +512,12 @@ public class EntityManager {
             metadata.setFieldValue(entity, field, value);
         }
 
+        // Refresh eager relationships to match current database state.
+        relationshipManager.prepareRelationships(entity, metadata);
+        relationshipManager.hydrateEagerSingleRefs(entity, metadata);
+        relationshipManager.hydrateEagerCollections(entity, metadata);
+        relationshipManager.hydrateEagerManyToMany(entity, metadata);
+
         // Ensure it's in identity map
         EntityKey key = new EntityKey(entity.getClass(), id);
         identityMap.put(key, entity);
@@ -523,6 +529,7 @@ public class EntityManager {
             snapshot.put(field, metadata.getFieldValue(entity, field));
         }
         originalValues.put(key, snapshot);
+        cacheProvider.put(CacheKey.of(entity.getClass(), id), takeEntitySnapshot(entity, metadata), cacheTtl);
 
         // Handle cascade refresh
         relationshipManager.cascadeRefresh(entity, metadata);
@@ -968,6 +975,7 @@ public class EntityManager {
         relationshipManager.prepareRelationships(entity, metadata);
         relationshipManager.hydrateEagerSingleRefs(entity, metadata);
         relationshipManager.hydrateEagerCollections(entity, metadata);
+        relationshipManager.hydrateEagerManyToMany(entity, metadata);
         originalValues.put(key, takeSnapshotValues(entity, metadata));
         cacheProvider.put(CacheKey.of(entity.getClass(), id), takeEntitySnapshot(entity, metadata), cacheTtl);
         return entity;
@@ -1077,7 +1085,7 @@ public class EntityManager {
         return entity;
     }
 
-    private record ManyToManyJoinTable(String joinTable, String ownerColumn, String inverseColumn, boolean thisIsOwner) {
+    record ManyToManyJoinTable(String joinTable, String ownerColumn, String inverseColumn, boolean thisIsOwner) {
         String thisColumn() {
             return thisIsOwner ? ownerColumn : inverseColumn;
         }
@@ -1097,7 +1105,7 @@ public class EntityManager {
 
     private record ManyToManyDirtyKey(Class<?> entityClass, Object id, String fieldName) {}
 
-    private Set<Object> loadManyToManyOtherIds(ManyToManyJoinTable join, Object thisId, Class<?> otherIdType) {
+    Set<Object> loadManyToManyOtherIds(ManyToManyJoinTable join, Object thisId, Class<?> otherIdType) {
         String sql = "SELECT " + dialect.quoteIdentifier(join.otherColumn()) +
                 " FROM " + dialect.quoteIdentifier(join.joinTable()) +
                 " WHERE " + dialect.quoteIdentifier(join.thisColumn()) + " = ?";
@@ -1273,7 +1281,7 @@ public class EntityManager {
         }
     }
 
-    private ManyToManyJoinTable resolveManyToManyJoinTable(EntityMetadata thisMetadata, de.t14d3.spool.mapping.RelationshipMapping relationship) {
+    ManyToManyJoinTable resolveManyToManyJoinTable(EntityMetadata thisMetadata, de.t14d3.spool.mapping.RelationshipMapping relationship) {
         Field field = relationship.field();
         String mappedBy = relationship.mappedBy();
         boolean thisIsOwner = mappedBy == null || mappedBy.isBlank();
