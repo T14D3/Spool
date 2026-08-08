@@ -377,4 +377,39 @@ public class MigrationTest {
         assertTrue(em.validateSchema(), "Schema should be valid after transactional migration");
         System.out.println("✓ Migration with transaction works correctly");
     }
+
+    @Test
+    @Order(13)
+    void testSqliteAutoIncrementDdl() {
+        System.out.println("=== Testing SQLite auto-increment DDL ===");
+
+        // Regression test: for SQLite, an auto-increment PK must be declared inline
+        // as "INTEGER PRIMARY KEY AUTOINCREMENT" (rowid alias). The previous DDL
+        // ("INTEGER AUTO_INCREMENT" + table-level PRIMARY KEY) silently stored NULL
+        // in the id column, breaking findAll/findById for @Id(autoIncrement = true).
+        TableDefinition table = new TableDefinition("home");
+        table.addColumn(new ColumnDefinition.Builder()
+                .name("id")
+                .sqlType("BIGINT")
+                .primaryKey(true)
+                .autoIncrement(true)
+                .build());
+        table.addColumn(new ColumnDefinition.Builder()
+                .name("name")
+                .sqlType("VARCHAR")
+                .nullable(false)
+                .build());
+
+        SqlGenerator generator = new SqlGenerator(Dialect.SQLITE);
+        SchemaDiff diff = new SchemaDiff();
+        diff.addChange(SchemaDiff.SchemaChange.createTable(table));
+        String sql = String.join(";\n", generator.generateSql(diff));
+
+        assertTrue(sql.contains("\"id\" INTEGER PRIMARY KEY AUTOINCREMENT"),
+                "SQLite auto-increment PK must be declared inline as rowid alias, got: " + sql);
+        assertFalse(sql.contains("PRIMARY KEY (\"id\")"),
+                "SQLite auto-increment PK must not also appear in a table-level PRIMARY KEY clause, got: " + sql);
+        System.out.println("Generated SQLite DDL: " + sql);
+        System.out.println("✓ SQLite auto-increment DDL is correct");
+    }
 }

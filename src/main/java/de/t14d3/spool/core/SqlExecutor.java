@@ -89,6 +89,19 @@ public class SqlExecutor {
         }
     }
 
+    public long count(String tableName) {
+        String sql = "SELECT COUNT(*) FROM " + dialect.quoteIdentifier(tableName);
+        try (PreparedStatement stmt = connection.prepareStatement(sql);
+             ResultSet rs = stmt.executeQuery()) {
+            if (rs.next()) {
+                return rs.getLong(1);
+            }
+            return 0L;
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to count rows in " + tableName, e);
+        }
+    }
+
     // ---------------------------------------------------------------------
     // High-level ORM operations using Query builders
     // ---------------------------------------------------------------------
@@ -133,6 +146,24 @@ public class SqlExecutor {
         }
     }
 
+    public boolean existsById(Class<?> entityClass, Object id) {
+        EntityMetadata metadata = EntityMetadata.of(entityClass);
+        Query q = Query.select(dialect, "1")
+                .from(metadata.getTableName())
+                .where(metadata.getIdColumnName() + " = ?", id)
+                .limit("1")
+                .build();
+
+        try (PreparedStatement stmt = connection.prepareStatement(q.getSql())) {
+            setParameters(stmt, q.getParameters());
+            try (ResultSet rs = stmt.executeQuery()) {
+                return rs.next();
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to check entity existence by ID: " + id, e);
+        }
+    }
+
     public void delete(Object entity, EntityMetadata metadata) {
         Object id = metadata.getIdValue(entity);
         if (id == null) {
@@ -146,17 +177,27 @@ public class SqlExecutor {
         executeUpdate(q.getSql(), q.getParameters());
     }
 
+    private static boolean isUnsetAutoIncrementId(EntityMetadata metadata, Object idValue) {
+        if (!metadata.isAutoIncrement()) {
+            return false;
+        }
+        if (idValue == null) {
+            return true;
+        }
+        return idValue instanceof Number n && n.longValue() == 0L;
+    }
+
     public void insert(Object entity, EntityMetadata metadata) {
+        Object idVal = metadata.getIdValue(entity);
+        boolean shouldGenerateId = isUnsetAutoIncrementId(metadata, idVal);
+
         List<String> cols = new ArrayList<>();
         List<Object> vals = new ArrayList<>();
 
         for (Field field : metadata.getFields()) {
-            // skip null auto-generated id
-            if (field.equals(metadata.getIdField()) && metadata.isAutoIncrement()) {
-                Object idVal = metadata.getIdValue(entity);
-                if (idVal == null) {
-                    continue;
-                }
+            // Skip auto-generated id when unset (null or 0).
+            if (field.equals(metadata.getIdField()) && shouldGenerateId) {
+                continue;
             }
 
             cols.add(metadata.getColumnName(field));
@@ -184,7 +225,7 @@ public class SqlExecutor {
                 .values(vals.toArray())
                 .build();
 
-        if (metadata.isAutoIncrement() && metadata.getIdValue(entity) == null) {
+        if (shouldGenerateId) {
             Object generated = executeInsert(q.getSql(), q.getParameters());
             if (generated != null) {
                 Object converted = de.t14d3.spool.mapping.TypeMapper.convertToJavaType(generated, metadata.getIdField().getType());

@@ -139,6 +139,19 @@ public class RelationshipManager {
                 // Update the field with merged entities if they changed
                 if (mergedRelatedEntities != relatedEntities) {
                     metadata.setFieldValue(entity, relationship.field(), mergedRelatedEntities);
+                    // Re-wrap ManyToMany collection after replacement to restore the
+                    // bidirectional-sync wrapper (ManyToManySet/List/Collection) that
+                    // was removed when mergeRelatedEntities returned a plain collection.
+                    if (relationship.relationshipType() == RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+                        Field invField = resolveManyToManyInverseField(
+                            metadata.getEntityClass(),
+                            relationship.field(),
+                            relationship.targetEntity(),
+                            relationship.mappedBy());
+                        if (invField != null) {
+                            wrapManyToManyCollection(entity, relationship.field(), invField);
+                        }
+                    }
                 }
             }
         }
@@ -157,7 +170,7 @@ public class RelationshipManager {
                 entityManager.remove(relatedEntities);
                 break;
 
-            case ONE_TO_MANY, MANY_TO_MANY:
+            case ONE_TO_MANY:
                 if (relatedEntities instanceof Collection) {
                     // Create a copy to avoid concurrent modification
                     List<Object> toRemove = new ArrayList<>((Collection<?>) relatedEntities);
@@ -167,6 +180,12 @@ public class RelationshipManager {
                         }
                     }
                 }
+                break;
+
+            case MANY_TO_MANY:
+                // Do NOT cascade delete related entities - ManyToMany entities are shared
+                // across multiple owners. Only join-table rows are deleted at flush time
+                // by deleteManyToManyJoinRows().
                 break;
 
             case MANY_TO_ONE:
@@ -238,13 +257,18 @@ public class RelationshipManager {
             case ONE_TO_ONE, MANY_TO_ONE -> entityManager.merge(relatedEntities);
             case ONE_TO_MANY, MANY_TO_MANY -> {
                 if (relatedEntities instanceof Collection<?> originalCollection) {
-                    List<Object> mergedList = new ArrayList<>();
+                    // Preserve the original collection type (Set vs List) to avoid
+                    // IllegalArgumentException when field.set() receives an ArrayList
+                    // for a Set-typed field.
+                    Collection<Object> mergedCollection = (originalCollection instanceof Set)
+                        ? new LinkedHashSet<>()
+                        : new ArrayList<>();
                     for (Object item : originalCollection) {
                         if (item != null) {
-                            mergedList.add(entityManager.merge(item));
+                            mergedCollection.add(entityManager.merge(item));
                         }
                     }
-                    yield mergedList;
+                    yield mergedCollection;
                 }
                 yield relatedEntities;
             }
@@ -502,11 +526,6 @@ public class RelationshipManager {
             if (relationship.targetEntity() == Object.class) {
                 continue;
             }
-            if (relationship.mappedBy() != null && !relationship.mappedBy().isBlank()) {
-                // Skip inverse side hydration (see method Javadoc).
-                continue;
-            }
-
             EntityManager.ManyToManyJoinTable join = entityManager.resolveManyToManyJoinTable(metadata, relationship);
             if (join == null) {
                 continue;
@@ -822,7 +841,6 @@ public class RelationshipManager {
             if (!added || manager.isBidirectionalSyncSuppressed() || o == null) {
                 return added;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             manager.wrapManyToManyCollection(o, inverseField, ownerField);
             manager.ensureInverseContains(owner, o, inverseField);
@@ -835,7 +853,6 @@ public class RelationshipManager {
             if (!removed || manager.isBidirectionalSyncSuppressed() || o == null) {
                 return removed;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             manager.removeInverseLink(owner, o, inverseField);
             return true;
@@ -847,7 +864,6 @@ public class RelationshipManager {
                 delegate.clear();
                 return;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             List<Object> items = new ArrayList<>(delegate);
             delegate.clear();
@@ -890,7 +906,6 @@ public class RelationshipManager {
             if (manager.isBidirectionalSyncSuppressed()) {
                 return old;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             if (old != null) {
                 manager.removeInverseLink(owner, old, inverseField);
@@ -908,7 +923,6 @@ public class RelationshipManager {
             if (manager.isBidirectionalSyncSuppressed() || element == null) {
                 return;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             manager.wrapManyToManyCollection(element, inverseField, ownerField);
             manager.ensureInverseContains(owner, element, inverseField);
@@ -920,7 +934,6 @@ public class RelationshipManager {
             if (!added || manager.isBidirectionalSyncSuppressed() || element == null) {
                 return added;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             manager.wrapManyToManyCollection(element, inverseField, ownerField);
             manager.ensureInverseContains(owner, element, inverseField);
@@ -933,7 +946,6 @@ public class RelationshipManager {
             if (manager.isBidirectionalSyncSuppressed() || removed == null) {
                 return removed;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             manager.removeInverseLink(owner, removed, inverseField);
             return removed;
@@ -945,7 +957,6 @@ public class RelationshipManager {
             if (!removed || manager.isBidirectionalSyncSuppressed() || o == null) {
                 return removed;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             manager.removeInverseLink(owner, o, inverseField);
             return true;
@@ -957,7 +968,6 @@ public class RelationshipManager {
                 delegate.clear();
                 return;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             List<Object> items = new ArrayList<>(delegate);
             delegate.clear();
@@ -1023,7 +1033,6 @@ public class RelationshipManager {
             if (!added || manager.isBidirectionalSyncSuppressed() || o == null) {
                 return added;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             manager.wrapManyToManyCollection(o, inverseField, ownerField);
             manager.ensureInverseContains(owner, o, inverseField);
@@ -1036,7 +1045,6 @@ public class RelationshipManager {
             if (!removed || manager.isBidirectionalSyncSuppressed() || o == null) {
                 return removed;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             manager.removeInverseLink(owner, o, inverseField);
             return true;
@@ -1048,7 +1056,6 @@ public class RelationshipManager {
                 delegate.clear();
                 return;
             }
-            manager.entityManager.markDirty(owner);
             manager.entityManager.markManyToManyDirty(owner, ownerField);
             List<Object> items = new ArrayList<>(delegate);
             delegate.clear();

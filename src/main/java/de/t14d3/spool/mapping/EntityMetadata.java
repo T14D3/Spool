@@ -171,9 +171,17 @@ public class EntityMetadata {
 
     /**
      * Sets the ID value on an entity instance.
+     * <p>
+     * If the value is null and the ID field is a primitive type, the call is
+     * silently skipped to avoid {@link IllegalArgumentException} from
+     * {@link java.lang.reflect.Field#set(Object, Object)}. The field retains
+     * its JVM default (0, 0L, 0.0, false, etc.).
      */
     public void setIdValue(Object entity, Object value) {
         try {
+            if (value == null && idField.getType().isPrimitive()) {
+                return;
+            }
             idField.set(entity, value);
         } catch (IllegalAccessException e) {
             throw new RuntimeException("Cannot set ID field", e);
@@ -193,9 +201,16 @@ public class EntityMetadata {
 
     /**
      * Sets the value of a field on an entity instance.
+     * <p>
+     * If the value is null and the target field is a primitive type, the call
+     * is silently skipped to avoid {@link IllegalArgumentException}. The
+     * field retains its JVM default.
      */
     public void setFieldValue(Object entity, Field field, Object value) {
         try {
+            if (value == null && field.getType().isPrimitive()) {
+                return;
+            }
             field.set(entity, value);
         } catch (IllegalAccessException e) {
             throw new RuntimeException("Cannot set field " + field.getName(), e);

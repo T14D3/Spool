@@ -18,9 +18,48 @@ public interface CacheProvider extends AutoCloseable {
 
     void clear();
 
+    /**
+     * Gets cache statistics for monitoring and debugging.
+     *
+     * <p>The default implementation returns empty statistics.
+     * Implementations that support statistics should override this method.</p>
+     *
+     * @return the cache statistics
+     */
+    default CacheStatistics getStats() {
+        return CacheStatistics.empty();
+    }
+
+    /**
+     * Sets an event handler for cache operations.
+     *
+     * <p>This allows external systems to be notified of cache events
+     * such as puts, invalidations, and hits/misses.</p>
+     *
+     * <p>The default implementation is a no-op.</p>
+     *
+     * @param handler the event handler, or null to remove
+     */
+    default void setEventHandler(CacheEventHandler handler) {
+        // no-op by default
+    }
+
+    /**
+     * Checks if this cache provider supports distributed caching.
+     *
+     * <p>Distributed cache providers can synchronize cache state across
+     * multiple servers or processes.</p>
+     *
+     * <p>The default implementation returns false.</p>
+     *
+     * @return true if this is a distributed cache provider
+     */
+    default boolean isDistributed() {
+        return false;
+    }
+
     @Override
     default void close() {
         // no-op
     }
 }
-

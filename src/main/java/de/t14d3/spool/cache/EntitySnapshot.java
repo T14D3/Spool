@@ -1,6 +1,7 @@
 package de.t14d3.spool.cache;
 
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -17,7 +18,13 @@ public final class EntitySnapshot {
     public EntitySnapshot(String entityClassName, String id, Map<String, Object> fieldValues) {
         this.entityClassName = Objects.requireNonNull(entityClassName, "entityClassName");
         this.id = Objects.requireNonNull(id, "id");
-        this.fieldValues = Collections.unmodifiableMap(Map.copyOf(Objects.requireNonNull(fieldValues, "fieldValues")));
+
+        Map<String, Object> values = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : Objects.requireNonNull(fieldValues, "fieldValues").entrySet()) {
+            String key = Objects.requireNonNull(entry.getKey(), "fieldValues key");
+            values.put(key, entry.getValue());
+        }
+        this.fieldValues = Collections.unmodifiableMap(values);
     }
 
     public String entityClassName() {
@@ -32,4 +39,3 @@ public final class EntitySnapshot {
         return fieldValues;
     }
 }
-

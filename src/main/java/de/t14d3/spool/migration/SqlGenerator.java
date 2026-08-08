@@ -69,9 +69,20 @@ public class SqlGenerator {
             colDef.append(getColumnTypeDefinition(column));
 
             if (column.isPrimaryKey()) {
-                primaryKeys.add(q(column.getName()));
-                if (column.isAutoIncrement()) {
-                    colDef.append(" ").append(getAutoIncrementKeyword());       
+                if (dialect == Dialect.SQLITE && column.isAutoIncrement()) {
+                    // SQLite has no AUTO_INCREMENT: an auto-generated primary key must
+                    // be declared inline as "INTEGER PRIMARY KEY AUTOINCREMENT" (a
+                    // rowid alias). A table-level PRIMARY KEY constraint on a plain
+                    // INTEGER column does NOT auto-generate values (the column would
+                    // stay NULL on insert), and combining both forms raises
+                    // "table has more than one primary key". Hence the column is
+                    // excluded from the table-level PRIMARY KEY clause below.
+                    colDef.append(" PRIMARY KEY AUTOINCREMENT");
+                } else {
+                    primaryKeys.add(q(column.getName()));
+                    if (column.isAutoIncrement()) {
+                        colDef.append(" ").append(getAutoIncrementKeyword());
+                    }
                 }
             }
 
@@ -249,6 +260,7 @@ public class SqlGenerator {
             case POSTGRESQL:
                 return ""; // PostgreSQL uses SERIAL type instead
             case SQLITE:
+                return "AUTOINCREMENT"; // only used inline: "INTEGER PRIMARY KEY AUTOINCREMENT"
             case H2:
                 return "AUTO_INCREMENT";
             default:

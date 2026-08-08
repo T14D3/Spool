@@ -12,21 +12,21 @@ import java.util.*;
 /**
  * Spool ORM CLI - Command-line interface for schema generation, migration management,
  * and entity validation.
- * 
+ * <p>
  * Usage:
  *   java -cp ... de.t14d3.spool.Main [command] [options]
- * 
+ * <p>
  * Commands:
- *   validate <entity-class>...     - Validate entity annotations and configuration
- *   schema <entity-class>...       - Generate schema SQL for entities
- *   migrate [options] <entity-class>...  - Generate and apply migrations
+ *   validate &lt;entity-class>...     - Validate entity annotations and configuration
+ *   schema &lt;entity-class>...       - Generate schema SQL for entities
+ *   migrate [options] &lt;entity-class>...  - Generate and apply migrations
  *   inspect [options]              - Inspect database schema
  *   help                          - Show this help message
- * 
+ * <p>
  * Options:
- *   --db-url <url>                - Database URL (default: jdbc:h2:mem:test)
+ *   --db-url &lt;url>                - Database URL (default: jdbc:h2:mem:test)
  *   --dry-run                     - Show SQL without executing (for migrate command)
- *   --package <package>           - Package to scan for entities
+ *   --package &lt;package>           - Package to scan for entities
  *   --verbose                     - Verbose output
  */
 public class Main {

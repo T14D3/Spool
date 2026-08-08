@@ -279,6 +279,17 @@ public class MigrationManager {
      * Record a migration as applied.
      */
     private void recordMigration(String version, String description, String checksum) throws SQLException {
+        // Check if this version was already recorded (handles duplicate calls safely)
+        String checkSql = "SELECT COUNT(*) FROM " + MIGRATION_TABLE + " WHERE version = ?";
+        try (PreparedStatement stmt = connection.prepareStatement(checkSql)) {
+            stmt.setString(1, version);
+            try (java.sql.ResultSet rs = stmt.executeQuery()) {
+                if (rs.next() && rs.getInt(1) > 0) {
+                    return; // Already recorded, skip duplicate
+                }
+            }
+        }
+
         String sql = "INSERT INTO " + MIGRATION_TABLE + " (version, description, checksum) VALUES (?, ?, ?)";
         try (PreparedStatement stmt = connection.prepareStatement(sql)) {
             stmt.setString(1, version);

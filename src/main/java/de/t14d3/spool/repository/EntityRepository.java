@@ -114,7 +114,7 @@ public class EntityRepository<T> {
      * @return the total number of entities
      */
     public long count() {
-        return findAll().size();
+        return entityManager.getExecutor().count(metadata.getTableName());
     }
 
     /**

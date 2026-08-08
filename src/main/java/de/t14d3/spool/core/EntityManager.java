@@ -28,7 +28,8 @@ import java.sql.SQLException;
 import java.sql.Savepoint;
 import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * The main interface for interacting with the database.
@@ -41,11 +42,14 @@ public class EntityManager {
     private final Dialect dialect;
     private final ConcurrentHashMap<EntityKey, Object> identityMap;
     private final ConcurrentHashMap<EntityKey, Map<Field, Object>> originalValues;
-    private final Set<Object> pendingInserts;
-    private final Set<Object> pendingUpdates;
-    private final Set<Object> pendingDeletes;
+    private final ConcurrentLinkedQueue<Object> pendingInserts;
+    private final ConcurrentLinkedQueue<Object> pendingUpdates;
+    private final ConcurrentLinkedQueue<Object> pendingDeletes;
     private final RelationshipManager relationshipManager;
+    private final ThreadLocal<Set<Object>> cascadingDetachStack;
+    private final ThreadLocal<Set<Object>> cascadingRefreshStack;
     private final Set<ManyToManyDirtyKey> dirtyManyToMany;
+    private final Set<Object> detachedEntities;
     private CacheProvider cacheProvider;
     private CacheEventSink cacheEventSink;
     private Duration cacheTtl;
@@ -61,11 +65,14 @@ public class EntityManager {
         this.executor = new SqlExecutor(connection);
         this.identityMap = new ConcurrentHashMap<>();
         this.originalValues = new ConcurrentHashMap<>();
-        this.pendingInserts = new LinkedHashSet<>();
-        this.pendingUpdates = new LinkedHashSet<>();
-        this.pendingDeletes = new LinkedHashSet<>();
+        this.pendingInserts = new ConcurrentLinkedQueue<>();
+        this.pendingUpdates = new ConcurrentLinkedQueue<>();
+        this.pendingDeletes = new ConcurrentLinkedQueue<>();
         this.relationshipManager = new RelationshipManager(this);
+        this.cascadingDetachStack = ThreadLocal.withInitial(() -> Collections.newSetFromMap(new IdentityHashMap<>()));
+        this.cascadingRefreshStack = ThreadLocal.withInitial(() -> Collections.newSetFromMap(new IdentityHashMap<>()));
         this.dirtyManyToMany = Collections.newSetFromMap(new ConcurrentHashMap<>());
+        this.detachedEntities = Collections.newSetFromMap(new IdentityHashMap<>());
         this.cacheProvider = new NoOpCacheProvider();
         this.cacheEventSink = new NoOpCacheEventSink();
         this.cacheTtl = Duration.ofMinutes(5);
@@ -120,72 +127,84 @@ public class EntityManager {
     /**
      * Begin a new transaction.
      * Disables auto-commit mode so that changes can be rolled back if needed.
+     * Synchronizes on the shared JDBC connection for thread safety.
      *
      * @throws IllegalStateException if a transaction is already active
      * @throws RuntimeException if the transaction cannot be started
      */
     public void beginTransaction() {
-        if (transactionActive) {
-            throw new IllegalStateException("Transaction already active");
-        }
-        try {
-            originalAutoCommit = connection.getAutoCommit();
-            connection.setAutoCommit(false);
-            transactionActive = true;
-        } catch (SQLException e) {
-            throw new RuntimeException("Failed to begin transaction", e);
+        synchronized (connection) {
+            if (transactionActive) {
+                throw new IllegalStateException("Transaction already active");
+            }
+            try {
+                originalAutoCommit = connection.getAutoCommit();
+                connection.setAutoCommit(false);
+                transactionActive = true;
+            } catch (SQLException e) {
+                throw new RuntimeException("Failed to begin transaction", e);
+            }
         }
     }
 
     /**
      * Commit the current transaction.
      * All changes made since beginTransaction() will be permanently saved.
+     * Synchronizes on the shared JDBC connection for thread safety.
      *
      * @throws IllegalStateException if no transaction is active
      * @throws RuntimeException if the commit fails
      */
     public void commit() {
-        if (!transactionActive) {
-            throw new IllegalStateException("No active transaction to commit");
-        }
-        try {
-            connection.commit();
-            connection.setAutoCommit(originalAutoCommit);
-            transactionActive = false;
-        } catch (SQLException e) {
-            throw new RuntimeException("Failed to commit transaction", e);
+        synchronized (connection) {
+            if (!transactionActive) {
+                throw new IllegalStateException("No active transaction to commit");
+            }
+            try {
+                connection.commit();
+                connection.setAutoCommit(originalAutoCommit);
+                transactionActive = false;
+            } catch (SQLException e) {
+                throw new RuntimeException("Failed to commit transaction", e);
+            }
         }
     }
 
     /**
      * Rollback the current transaction.
      * All changes made since beginTransaction() will be discarded.
+     * Synchronizes on the shared JDBC connection for thread safety.
      *
      * @throws IllegalStateException if no transaction is active
      * @throws RuntimeException if the rollback fails
      */
     public void rollback() {
-        if (!transactionActive) {
-            throw new IllegalStateException("No active transaction to rollback");
-        }
-        try {
-            connection.rollback();
-            connection.setAutoCommit(originalAutoCommit);
-            transactionActive = false;
-            // Clear pending operations since they've been rolled back
-            clear();
-        } catch (SQLException e) {
-            throw new RuntimeException("Failed to rollback transaction", e);
+        synchronized (connection) {
+            if (!transactionActive) {
+                throw new IllegalStateException("No active transaction to rollback");
+            }
+            try {
+                connection.rollback();
+                connection.setAutoCommit(originalAutoCommit);
+                transactionActive = false;
+                // Clear pending operations since they've been rolled back
+                clear();
+            } catch (SQLException e) {
+                throw new RuntimeException("Failed to rollback transaction", e);
+            }
         }
     }
 
     /**
      * Check if a transaction is currently active.
+     * Synchronizes on the shared JDBC connection for thread safety.
      *
      * @return true if a transaction is active, false otherwise
      */
     public boolean isTransactionActive() {
-        return transactionActive;
+        synchronized (connection) {
+            return transactionActive;
+        }
     }
 
     /**
@@ -233,6 +252,10 @@ public class EntityManager {
 
     /**
      * Mark an entity for persistence. The entity will be inserted or updated on flush.
+     * <p>
+     * Thread-safe: uses identity map lookup (ConcurrentHashMap, lock-free) to
+     * route already-managed entities to pendingUpdates and new entities to
+     * pendingInserts.
      */
     public void persist(Object entity) {
         if (entity == null) {
@@ -242,16 +265,10 @@ public class EntityManager {
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
         relationshipManager.prepareRelationships(entity, metadata);
         Object id = metadata.getIdValue(entity);
-
-        if (id == null || !isInDatabase(entity, metadata)) {
-            // New entity - mark for insert
-            pendingInserts.add(entity);
-            pendingUpdates.remove(entity); // Remove from updates if present
+        if (id != null && identityMap.containsKey(new EntityKey(entity.getClass(), id))) {
+            pendingUpdates.add(entity);
         } else {
-            // Existing entity - mark for update
-            if (!pendingInserts.contains(entity)) {
-                pendingUpdates.add(entity);
-            }
+            pendingInserts.add(entity);
         }
     }
 
@@ -264,36 +281,28 @@ public class EntityManager {
             return;
         }
 
-        // If already processed or in pending inserts, skip
-        if (pendingInserts.contains(entity)) {
-            return;
-        }
-
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
         relationshipManager.prepareRelationships(entity, metadata);
         Object id = metadata.getIdValue(entity);
-
-        if (id == null || !isInDatabase(entity, metadata)) {
-            // Add to pending inserts so it gets processed in this flush cycle
-            pendingInserts.add(entity);
-        } else {
-            // Existing entity - mark for update
+        if (id != null && identityMap.containsKey(new EntityKey(entity.getClass(), id))) {
             pendingUpdates.add(entity);
+        } else {
+            pendingInserts.add(entity);
         }
     }
 
     /**
      * Mark an entity for removal. The entity will be deleted on flush.
+     * <p>
+     * Thread-safe: enqueues the operation in a lock-free {@link ConcurrentLinkedQueue}.
+     * No external synchronization required.
      */
     public void remove(Object entity) {
         if (entity == null) {
             throw new IllegalArgumentException("Cannot remove null entity");
         }
 
-        relationshipManager.unlinkManyToMany(entity, EntityMetadata.of(entity.getClass()));
         pendingDeletes.add(entity);
-        pendingInserts.remove(entity);
-        pendingUpdates.remove(entity);
 
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
         Object id = metadata.getIdValue(entity);
@@ -305,184 +314,284 @@ public class EntityManager {
     }
 
     /**
-     * Find an entity by its ID.
+     * Checks whether an entity with the given class and id is currently managed
+     * (present in the identity map) without performing any I/O.
+     * <p>
+     * This is the cheap pre-check for eviction: callers that want to drop a
+     * stale identity-map entry can call {@link #isManaged} first and only
+     * {@link #find}/{@link #detach} when it returns {@code true}, avoiding a
+     * database read when the entity was never loaded locally.
+     *
+     * @param entityClass the entity class
+     * @param id          the entity id (must use the same id type as the entity's id field)
+     * @return {@code true} if the entity is currently managed in the identity map
      */
+    public boolean isManaged(Class<?> entityClass, Object id) {
+        if (id == null) {
+            return false;
+        }
+        return identityMap.containsKey(new EntityKey(entityClass, id));
+    }
+
+    /**
+     * Find an entity by its ID.
+     * <p>
+     * Thread-safe: identity map and L2 cache lookups are lock-free.
+     * Database access synchronizes on the shared JDBC connection.
+     */
+    @SuppressWarnings("unchecked")
     public <T> T find(Class<T> entityClass, Object id) {
         if (id == null) {
             return null;
         }
 
-        // Check identity map first
+        // Check identity map first (ConcurrentHashMap - lock-free)
         EntityKey key = new EntityKey(entityClass, id);
-        @SuppressWarnings("unchecked")
         T cached = (T) identityMap.get(key);
         if (cached != null) {
             return cached;
         }
 
-        // Check L2 cache (entity-by-id)
         EntityMetadata metadata = EntityMetadata.of(entityClass);
+
+        // Check L2 cache (entity-by-id)
         Optional<EntitySnapshot> snapshot = cacheProvider.get(CacheKey.of(entityClass, id));
         if (snapshot.isPresent()) {
             T entity = hydrateFromSnapshot(entityClass, metadata, snapshot.get());
             return manageLoadedEntity(entity, metadata);
         }
 
-        // Load from database
-        T entity = executor.findById(entityClass, id);
-        if (entity == null) {
-            return null;
+        // Load from database - synchronize on the shared JDBC connection
+        synchronized (connection) {
+            T entity = executor.findById(entityClass, id);
+            if (entity == null) {
+                return null;
+            }
+            return manageLoadedEntity(entity, metadata);
         }
-        return manageLoadedEntity(entity, metadata);
     }
 
     /**
      * Flush all pending changes to the database.
+     * <p>
+     * Thread-safe: drains the concurrent operation queues, then processes
+     * all changes under the shared JDBC connection lock. The connection
+     * lock is held only during actual SQL I/O, not during entity mutation
+     * tracking (which is lock-free via ConcurrentLinkedQueue).
+     * <p>
      * If a transaction is active and an exception occurs, the transaction
-     * will be automatically rolled back.
+     * is automatically rolled back.
      *
-     * @throws RuntimeException if flush fails (transaction will be rolled back if active)
+     * @throws RuntimeException if flush fails
      */
+    @SuppressWarnings({"unchecked", "rawtypes"})
     public void flush() {
-        // Take snapshots of pending operations for potential rollback recovery
-        Set<Object> insertSnapshot = new LinkedHashSet<>(pendingInserts);
-        Set<Object> updateSnapshot = new LinkedHashSet<>(pendingUpdates);
-        Set<Object> deleteSnapshot = new LinkedHashSet<>(pendingDeletes);
-        Map<EntityKey, Object> identityMapSnapshot = new HashMap<>(identityMap);
-        Map<EntityKey, Map<Field, Object>> originalValuesSnapshot = new HashMap<>(originalValues);
+        // 1. Atomically drain all pending operation queues (lock-free).
+        // 2. Drain queues and process under the shared connection lock.
+        List<Object> inserts = drainList(pendingInserts);
+        List<Object> deletes = drainList(pendingDeletes);
+        List<Object> updates = drainList(pendingUpdates);
 
-        Map<CacheKey, CacheEvent.Operation> cacheEvents = new LinkedHashMap<>();
-        Set<Object> insertedEntities = new LinkedHashSet<>();
+        synchronized (connection) {
+            Map<EntityKey, Object> identityMapSnapshot = new HashMap<>(identityMap);
+            Map<EntityKey, Map<Field, Object>> originalValuesSnapshot = new HashMap<>(originalValues);
 
-        try {
-            // Process deletes first with cascade remove
-            // Use a local queue/drain approach so cascadeRemove can safely add new deletes.
-            Set<Object> processedDeletes = Collections.newSetFromMap(new IdentityHashMap<>());
-            Deque<Object> deleteQueue = new ArrayDeque<>(pendingDeletes);
-            pendingDeletes.clear();
+            Map<CacheKey, CacheEvent.Operation> cacheEvents = new LinkedHashMap<>();
+            Set<Object> insertedEntities = new LinkedHashSet<>();
 
-            while (!deleteQueue.isEmpty()) {
-                Object entity = deleteQueue.pollFirst();
-                if (entity == null || !processedDeletes.add(entity)) {
-                    continue;
+            try {
+                // ── Dedup ────────────────────────────────────────────────
+                // If an entity is in both inserts and deletes, delete wins.
+                Set<Object> deleteSet = Collections.newSetFromMap(new IdentityHashMap<>());
+                for (Object e : deletes) {
+                    EntityMetadata meta = EntityMetadata.of(e.getClass());
+                    Object id = meta.getIdValue(e);
+                    if (id != null) {
+                        EntityKey key = new EntityKey(e.getClass(), id);
+                        Object managed = identityMap.get(key);
+                        deleteSet.add(managed != null ? managed : e);
+                    } else {
+                        deleteSet.add(e);
+                    }
+                }
+                inserts.removeIf(deleteSet::contains);
+
+                // Filter out entities that were explicitly detached.
+                // Auto-increment entities with id=0 or null are NEW, not detached.
+                inserts.removeIf(e -> {
+                    EntityMetadata meta = EntityMetadata.of(e.getClass());
+                    Object id = meta.getIdValue(e);
+                    if (id == null) return false;
+                    // Entities with an explicit ID that was never managed are new - keep them.
+                    // Only filter if the entity was explicitly detached via detach().
+                    if (meta.isAutoIncrement() && id instanceof Number n && n.longValue() == 0L) {
+                        return false;
+                    }
+                    return detachedEntities.contains(e);
+                });
+
+                // ── Process deletes ──────────────────────────────────────
+                Set<Object> processedDeletes = Collections.newSetFromMap(new IdentityHashMap<>());
+                Deque<Object> deleteQueue = new ArrayDeque<>(deleteSet);
+
+                while (!deleteQueue.isEmpty()) {
+                    Object entity = deleteQueue.pollFirst();
+                    if (entity == null || !processedDeletes.add(entity)) continue;
+
+                    EntityMetadata meta = EntityMetadata.of(entity.getClass());
+                    deleteManyToManyJoinRows(entity, meta);
+                    relationshipManager.cascadeRemove(entity, meta);
+
+                    // Capture any cascade-triggered deletes.
+                    List<Object> cascadeDeletes = drainList(pendingDeletes);
+                    for (Object cd : cascadeDeletes) {
+                        if (!processedDeletes.contains(cd)) deleteQueue.addLast(cd);
+                    }
+
+                    // Unlink ManyToMany in-memory collections as part of the flush,
+                    // so rollback keeps the in-memory state consistent with the DB.
+                    relationshipManager.unlinkManyToMany(entity, meta);
+                    executor.delete(entity, meta);
+                    Object id = meta.getIdValue(entity);
+                    if (id != null) {
+                        recordCacheEvent(cacheEvents, CacheKey.of(entity.getClass(), id), CacheEvent.Operation.DELETE);
+                    }
                 }
 
-                EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-                deleteManyToManyJoinRows(entity, metadata);
-                relationshipManager.cascadeRemove(entity, metadata);
+                // ── Process inserts ──────────────────────────────────────
+                Deque<Object> insertQueue = new ArrayDeque<>(inserts);
+                Set<Object> processedInserts = Collections.newSetFromMap(new IdentityHashMap<>());
+                Set<Object> visitingInserts = Collections.newSetFromMap(new IdentityHashMap<>());
 
-                if (!pendingDeletes.isEmpty()) {
-                    deleteQueue.addAll(pendingDeletes);
-                    pendingDeletes.clear();
+                while (!insertQueue.isEmpty()) {
+                    Object entity = insertQueue.pollFirst();
+                    if (entity == null) continue;
+
+                    processInsertEntity(entity, processedInserts, visitingInserts, cacheEvents, insertedEntities);
+
+                    // Capture cascade-triggered inserts.
+                    List<Object> cascadeInserts = drainList(pendingInserts);
+                    for (Object ci : cascadeInserts) {
+                        if (!processedInserts.contains(ci)) insertQueue.addLast(ci);
+                    }
                 }
 
-                executor.delete(entity, metadata);
-                Object id = metadata.getIdValue(entity);
-                if (id != null) {
-                    recordCacheEvent(cacheEvents, CacheKey.of(entity.getClass(), id), CacheEvent.Operation.DELETE);
+                // ── Process updates ──────────────────────────────────────
+                // Dedup updates: use identity map to ensure we update managed instances.
+                Set<Object> updateSet = Collections.newSetFromMap(new IdentityHashMap<>());
+                for (Object e : updates) {
+                    EntityMetadata meta = EntityMetadata.of(e.getClass());
+                    Object id = meta.getIdValue(e);
+                    if (id == null) continue;
+                    EntityKey key = new EntityKey(e.getClass(), id);
+                    Object managed = identityMap.get(key);
+                    if (managed != null) updateSet.add(managed);
                 }
+
+                for (Object entity : updateSet) {
+                    EntityMetadata meta = EntityMetadata.of(entity.getClass());
+                    Object id = meta.getIdValue(entity);
+                    Map<Field, Object> snapshot = originalValues.get(new EntityKey(entity.getClass(), id));
+                    executor.update(entity, meta, snapshot);
+                    if (id != null) {
+                        originalValues.put(new EntityKey(entity.getClass(), id), takeSnapshotValues(entity, meta));
+                        recordCacheEvent(cacheEvents, CacheKey.of(entity.getClass(), id), CacheEvent.Operation.UPSERT);
+                    }
+                }
+
+                // ── Sync ManyToMany join tables ──────────────────────────
+                for (Object entity : insertedEntities) {
+                    if (entity != null) {
+                        syncManyToManyJoinRows(entity, EntityMetadata.of(entity.getClass()), true);
+                    }
+                }
+                for (Object entity : updateSet) {
+                    if (entity != null) {
+                        syncManyToManyJoinRows(entity, EntityMetadata.of(entity.getClass()), false);
+                    }
+                }
+                // Also sync dirty ManyToMany that were modified via collection add/remove
+                // without a corresponding markDirty (which would put the entity in updateSet).
+                // This is the primary path for pure ManyToMany collection modifications.
+                Set<ManyToManyDirtyKey> dirtyKeys = new LinkedHashSet<>(dirtyManyToMany);
+                for (ManyToManyDirtyKey dk : dirtyKeys) {
+                    EntityKey key = new EntityKey(dk.entityClass(), dk.id());
+                    Object entity = identityMap.get(key);
+                    if (entity != null && !insertedEntities.contains(entity) && !updateSet.contains(entity)) {
+                        syncManyToManyJoinRows(entity, EntityMetadata.of(entity.getClass()), false);
+                    }
+                }
+
+                publishCacheEvents(cacheEvents);
+            } catch (Exception e) {
+                // Restore identity map to pre-flush state.
+                identityMap.clear();
+                identityMap.putAll(identityMapSnapshot);
+                originalValues.clear();
+                originalValues.putAll(originalValuesSnapshot);
+
+                        // Re-queue unprocessed items for the next flush attempt.
+                pendingInserts.addAll(inserts);
+                pendingDeletes.addAll(deletes);
+                pendingUpdates.addAll(updates);
+
+                if (transactionActive) {
+                    try {
+                        connection.rollback();
+                        connection.setAutoCommit(originalAutoCommit);
+                        transactionActive = false;
+                    } catch (SQLException rollbackEx) {
+                        e.addSuppressed(rollbackEx);
+                    }
+                }
+
+                throw new RuntimeException(
+                    "Flush failed" + (transactionActive ? " (transaction rolled back)" : ""), e);
             }
-
-            // Process inserts with cascade persist
-            // Use a local drain + dependency ordering so ManyToOne/OneToOne references insert first.
-            Deque<Object> insertQueue = new ArrayDeque<>(pendingInserts);
-            pendingInserts.clear();
-
-            Set<Object> processedInserts = Collections.newSetFromMap(new IdentityHashMap<>());
-            Set<Object> visitingInserts = Collections.newSetFromMap(new IdentityHashMap<>());
-            while (!insertQueue.isEmpty()) {
-                Object entity = insertQueue.pollFirst();
-                if (entity == null) {
-                    continue;
-                }
-                processInsertEntity(entity, processedInserts, visitingInserts, cacheEvents, insertedEntities);
-
-                if (!pendingInserts.isEmpty()) {
-                    insertQueue.addAll(pendingInserts);
-                    pendingInserts.clear();
-                }
-            }
-
-            // Process updates
-            List<Object> updatesToProcess = new ArrayList<>(pendingUpdates);
-            for (Object entity : updatesToProcess) {
-                EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-                Object id = metadata.getIdValue(entity);
-                Map<Field, Object> snapshot = originalValues.get(new EntityKey(entity.getClass(), id));
-                executor.update(entity, metadata, snapshot);
-                if (id != null) {
-                    originalValues.put(new EntityKey(entity.getClass(), id), takeSnapshotValues(entity, metadata));
-                    recordCacheEvent(cacheEvents, CacheKey.of(entity.getClass(), id), CacheEvent.Operation.UPSERT);
-                }
-            }
-            pendingUpdates.clear();
-
-            // Sync ManyToMany join tables after all ids are assigned and updates are applied.
-            for (Object entity : insertedEntities) {
-                if (entity != null) {
-                    syncManyToManyJoinRows(entity, EntityMetadata.of(entity.getClass()), true);
-                }
-            }
-            for (Object entity : updatesToProcess) {
-                if (entity != null) {
-                    syncManyToManyJoinRows(entity, EntityMetadata.of(entity.getClass()), false);
-                }
-            }
-
-            publishCacheEvents(cacheEvents);
-
-        } catch (Exception e) {
-            // Restore pending operations state for retry or inspection
-            pendingInserts.clear();
-            pendingInserts.addAll(insertSnapshot);
-            pendingUpdates.clear();
-            pendingUpdates.addAll(updateSnapshot);
-            pendingDeletes.clear();
-            pendingDeletes.addAll(deleteSnapshot);
-            identityMap.clear();
-            identityMap.putAll(identityMapSnapshot);
-            originalValues.clear();
-            originalValues.putAll(originalValuesSnapshot);
-
-            // If transaction is active, rollback the database changes
-            if (transactionActive) {
-                try {
-                    connection.rollback();
-                    connection.setAutoCommit(originalAutoCommit);
-                    transactionActive = false;
-                } catch (SQLException rollbackEx) {
-                    e.addSuppressed(rollbackEx);
-                }
-            }
-
-            throw new RuntimeException("Flush failed" + (transactionActive ? "" : " and transaction was rolled back"), e);
         }
     }
 
     /**
      * Detach an entity from the EntityManager's control.
      * The entity will no longer be tracked by the identity map.
+     * <p>
+     * Note: pending operations (persist/remove) cannot be removed from the
+     * concurrent queues after submission. Flush will skip detached entities
+     * by checking the identity map at flush time.
      */
     public void detach(Object entity) {
         if (entity == null) {
-            throw new IllegalArgumentException("Cannot detach null entity");
+            throw new IllegalArgumentException("Cannot detach null entity");    
         }
 
-        EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-        Object id = metadata.getIdValue(entity);
-        if (id != null) {
-            EntityKey key = new EntityKey(entity.getClass(), id);
-            identityMap.remove(key);
-            originalValues.remove(key);
+        Set<Object> detachStack = cascadingDetachStack.get();
+        if (detachStack.contains(entity)) {
+            return;
         }
+        detachStack.add(entity);
+        try {
+            EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+            Object id = metadata.getIdValue(entity);
+            if (id != null) {
+                EntityKey key = new EntityKey(entity.getClass(), id);
+                identityMap.remove(key);
+                originalValues.remove(key);
+            }
 
-        // Handle cascade detach
-        relationshipManager.cascadeDetach(entity, metadata);
+            // Register as explicitly detached so flush can skip it.
+            detachedEntities.add(entity);
 
-        // Remove from any pending operations
-        pendingInserts.remove(entity);
-        pendingUpdates.remove(entity);
-        pendingDeletes.remove(entity);
+            // Handle cascade detach
+            relationshipManager.cascadeDetach(entity, metadata);
+
+            // Note: cannot remove from ConcurrentLinkedQueue.
+            // Flush dedup uses detachedEntities set to skip these.
+        } finally {
+            detachStack.remove(entity);
+            if (detachStack.isEmpty()) {
+                cascadingDetachStack.remove();
+            }
+        }
     }
 
     /**
@@ -491,9 +600,15 @@ public class EntityManager {
      */
     public void refresh(Object entity) {
         if (entity == null) {
-            throw new IllegalArgumentException("Cannot refresh null entity");
+            throw new IllegalArgumentException("Cannot refresh null entity");   
         }
 
+        Set<Object> refreshStack = cascadingRefreshStack.get();
+        if (refreshStack.contains(entity)) {
+            return;
+        }
+        refreshStack.add(entity);
+        try {
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
         Object id = metadata.getIdValue(entity);
         if (id == null) {
@@ -533,6 +648,12 @@ public class EntityManager {
 
         // Handle cascade refresh
         relationshipManager.cascadeRefresh(entity, metadata);
+        } finally {
+            refreshStack.remove(entity);
+            if (refreshStack.isEmpty()) {
+                cascadingRefreshStack.remove();
+            }
+        }
     }
 
     /**
@@ -584,6 +705,18 @@ public class EntityManager {
             }
         }
 
+        // Also transfer relationship collections (ManyToMany, OneToMany) which are
+        // excluded from getFields() but must be merged for correctness.
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (relationship.relationshipType() == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_MANY
+                    || relationship.relationshipType() == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_MANY) {
+                Object detachedValue = metadata.getFieldValue(entity, relationship.field());
+                if (detachedValue != null) {
+                    metadata.setFieldValue(managedEntity, relationship.field(), detachedValue);
+                }
+            }
+        }
+
         // Mark for update
         pendingUpdates.add(managedEntity);
 
@@ -605,11 +738,30 @@ public class EntityManager {
      * Clear all pending operations and the identity map.
      */
     public void clear() {
-        pendingInserts.clear();
-        pendingUpdates.clear();
-        pendingDeletes.clear();
+        drainQueue(pendingInserts);
+        drainQueue(pendingUpdates);
+        drainQueue(pendingDeletes);
         identityMap.clear();
         originalValues.clear();
+        detachedEntities.clear();
+    }
+
+    /** Atomically drain a concurrent queue (discard all items). */
+    private static void drainQueue(ConcurrentLinkedQueue<Object> queue) {
+        while (queue.poll() != null) ;
+    }
+
+    /**
+     * Atomically drain a concurrent queue into an ArrayList.
+     * After this call the queue is empty.
+     */
+    private static List<Object> drainList(ConcurrentLinkedQueue<Object> queue) {
+        List<Object> items = new ArrayList<>();
+        Object item;
+        while ((item = queue.poll()) != null) {
+            items.add(item);
+        }
+        return items;
     }
 
     /**
@@ -620,12 +772,14 @@ public class EntityManager {
      */
     public <T> List<T> findAll(Class<T> entityClass) {
         EntityMetadata metadata = EntityMetadata.of(entityClass);
-        List<T> rows = executor.findAll(entityClass);
-        List<T> managed = new ArrayList<>(rows.size());
-        for (T row : rows) {
-            managed.add(manageLoadedEntity(row, metadata));
+        synchronized (connection) {
+            List<T> rows = executor.findAll(entityClass);
+            List<T> managed = new ArrayList<>(rows.size());
+            for (T row : rows) {
+                managed.add(manageLoadedEntity(row, metadata));
+            }
+            return managed;
         }
-        return managed;
     }
 
     /**
@@ -633,20 +787,20 @@ public class EntityManager {
      */
     public <T> List<T> executeSelectQuery(Query query, Class<T> entityClass) {
         EntityMetadata metadata = EntityMetadata.of(entityClass);
-        List<T> results = new ArrayList<>();
-
-        try (PreparedStatement stmt = executor.getConnection().prepareStatement(query.getSql())) {
-            SqlExecutor.setParameters(stmt, query.getParameters());
-
-            try (ResultSet rs = stmt.executeQuery()) {
-                while (rs.next()) {
-                    T entity = SqlExecutor.mapResultSetToEntity(rs, metadata);
-                    results.add(manageLoadedEntity(entity, metadata));
+        synchronized (connection) {
+            List<T> results = new ArrayList<>();
+            try (PreparedStatement stmt = connection.prepareStatement(query.getSql())) {
+                SqlExecutor.setParameters(stmt, query.getParameters());
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        T entity = SqlExecutor.mapResultSetToEntity(rs, metadata);
+                        results.add(manageLoadedEntity(entity, metadata));
+                    }
                 }
+                return results;
+            } catch (SQLException e) {
+                throw new RuntimeException("Failed to execute query: " + query.getSql() + " params=" + query.getParameters(), e);
             }
-            return results;
-        } catch (SQLException e) {
-            throw new RuntimeException("Failed to execute query: " + query.getSql() + " params=" + query.getParameters(), e);
         }
     }
 
@@ -675,9 +829,6 @@ public class EntityManager {
         if (entity == null) {
             return;
         }
-        if (pendingInserts.contains(entity)) {
-            return;
-        }
 
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
         Object id = metadata.getIdValue(entity);
@@ -688,6 +839,7 @@ public class EntityManager {
         if (!identityMap.containsKey(key)) {
             return;
         }
+        // Enqueue update; dedup with pendingInserts is handled at flush time.
         pendingUpdates.add(entity);
     }
 
@@ -727,9 +879,7 @@ public class EntityManager {
             return true;
         }
 
-        // Check database
-        Object found = executor.findById(entity.getClass(), id);
-        return found != null;
+        return executor.existsById(entity.getClass(), id);
     }
 
     /**
