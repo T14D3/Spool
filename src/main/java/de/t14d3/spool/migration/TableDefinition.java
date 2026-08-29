@@ -1,5 +1,7 @@
 package de.t14d3.spool.migration;
 
+import de.t14d3.spool.mapping.UniqueConstraintDef;
+
 import java.util.*;
 
 /**
@@ -9,11 +11,13 @@ public class TableDefinition {
     private final String name;
     private final Map<String, ColumnDefinition> columns;
     private final List<String> primaryKeyColumns;
+    private final List<UniqueConstraintDef> uniqueConstraints;
 
     public TableDefinition(String name) {
         this.name = name;
         this.columns = new LinkedHashMap<>();
         this.primaryKeyColumns = new ArrayList<>();
+        this.uniqueConstraints = new ArrayList<>();
     }
 
     public String getName() {
@@ -47,12 +51,28 @@ public class TableDefinition {
         return columns.keySet();
     }
 
+    /**
+     * Adds a unique constraint to this table definition.
+     */
+    public void addUniqueConstraint(UniqueConstraintDef constraint) {
+        uniqueConstraints.add(constraint);
+    }
+
+    /**
+     * Returns the unique constraints declared on this table, in insertion
+     * order. May be empty.
+     */
+    public List<UniqueConstraintDef> getUniqueConstraints() {
+        return Collections.unmodifiableList(uniqueConstraints);
+    }
+
     @Override
     public String toString() {
         return "TableDefinition{" +
                 "name='" + name + '\'' +
                 ", columns=" + columns.keySet() +
                 ", primaryKeyColumns=" + primaryKeyColumns +
+                ", uniqueConstraints=" + uniqueConstraints +
                 '}';
     }
 }

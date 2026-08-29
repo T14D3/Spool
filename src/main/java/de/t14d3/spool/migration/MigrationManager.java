@@ -18,12 +18,14 @@ public class MigrationManager {
     private final Connection connection;
     private final SchemaIntrospector introspector;
     private final SqlGenerator sqlGenerator;
+    private final Dialect dialect;
     private final Set<Class<?>> entityClasses;
 
     public MigrationManager(Connection connection) {
         this.connection = connection;
+        this.dialect = detectDialect();
         this.introspector = new SchemaIntrospector(connection);
-        this.sqlGenerator = new SqlGenerator(detectDialect());
+        this.sqlGenerator = new SqlGenerator(dialect);
         this.entityClasses = new LinkedHashSet<>();
     }
 
@@ -115,8 +117,21 @@ public class MigrationManager {
         // Compare and generate diff
         SchemaDiff diff = SchemaDiff.compare(expectedSchema, actualSchema);
 
-        // Generate SQL
-        return sqlGenerator.generateSql(diff);
+        // Generate SQL, then interleave the per-table post-create statements
+        // (CREATE UNIQUE INDEX on SQLite, where the inline CREATE TABLE
+        // form omits unique constraints). The diff and the per-table
+        // statements are merged in the order CREATE TABLE -> its
+        // post-statements, so the resulting list is still a valid
+        // single transaction when executed in order.
+        List<String> statements = new ArrayList<>(sqlGenerator.generateSql(diff));
+        if (dialect == Dialect.SQLITE) {
+            for (SchemaDiff.SchemaChange change : diff.getChanges()) {
+                if (change.getType() == SchemaDiff.ChangeType.CREATE_TABLE) {
+                    statements.addAll(sqlGenerator.generatePostCreateTableStatements(change.getTableDefinition()));
+                }
+            }
+        }
+        return statements;
     }
 
     /**

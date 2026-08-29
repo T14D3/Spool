@@ -1,5 +1,7 @@
 package de.t14d3.spool.migration;
 
+import de.t14d3.spool.mapping.UniqueConstraintDef;
+
 import java.util.*;
 
 /**
@@ -16,7 +18,9 @@ public class SchemaDiff {
         DROP_TABLE,
         ADD_COLUMN,
         DROP_COLUMN,
-        MODIFY_COLUMN
+        MODIFY_COLUMN,
+        ADD_UNIQUE_CONSTRAINT,
+        DROP_UNIQUE_CONSTRAINT
     }
 
     /**
@@ -28,34 +32,45 @@ public class SchemaDiff {
         private final ColumnDefinition column;
         private final ColumnDefinition oldColumn; // For MODIFY_COLUMN
         private final TableDefinition tableDefinition; // For CREATE_TABLE
+        private final UniqueConstraintDef uniqueConstraint; // For ADD/DROP_UNIQUE_CONSTRAINT
 
         private SchemaChange(ChangeType type, String tableName, ColumnDefinition column,
-                             ColumnDefinition oldColumn, TableDefinition tableDefinition) {
+                             ColumnDefinition oldColumn, TableDefinition tableDefinition,
+                             UniqueConstraintDef uniqueConstraint) {
             this.type = type;
             this.tableName = tableName;
             this.column = column;
             this.oldColumn = oldColumn;
             this.tableDefinition = tableDefinition;
+            this.uniqueConstraint = uniqueConstraint;
         }
 
         public static SchemaChange createTable(TableDefinition table) {
-            return new SchemaChange(ChangeType.CREATE_TABLE, table.getName(), null, null, table);
+            return new SchemaChange(ChangeType.CREATE_TABLE, table.getName(), null, null, table, null);
         }
 
         public static SchemaChange dropTable(String tableName) {
-            return new SchemaChange(ChangeType.DROP_TABLE, tableName, null, null, null);
+            return new SchemaChange(ChangeType.DROP_TABLE, tableName, null, null, null, null);
         }
 
         public static SchemaChange addColumn(String tableName, ColumnDefinition column) {
-            return new SchemaChange(ChangeType.ADD_COLUMN, tableName, column, null, null);
+            return new SchemaChange(ChangeType.ADD_COLUMN, tableName, column, null, null, null);
         }
 
         public static SchemaChange dropColumn(String tableName, ColumnDefinition column) {
-            return new SchemaChange(ChangeType.DROP_COLUMN, tableName, column, null, null);
+            return new SchemaChange(ChangeType.DROP_COLUMN, tableName, column, null, null, null);
         }
 
         public static SchemaChange modifyColumn(String tableName, ColumnDefinition newColumn, ColumnDefinition oldColumn) {
-            return new SchemaChange(ChangeType.MODIFY_COLUMN, tableName, newColumn, oldColumn, null);
+            return new SchemaChange(ChangeType.MODIFY_COLUMN, tableName, newColumn, oldColumn, null, null);
+        }
+
+        public static SchemaChange addUniqueConstraint(String tableName, UniqueConstraintDef constraint) {
+            return new SchemaChange(ChangeType.ADD_UNIQUE_CONSTRAINT, tableName, null, null, null, constraint);
+        }
+
+        public static SchemaChange dropUniqueConstraint(String tableName, UniqueConstraintDef constraint) {
+            return new SchemaChange(ChangeType.DROP_UNIQUE_CONSTRAINT, tableName, null, null, null, constraint);
         }
 
         public ChangeType getType() {
@@ -78,12 +93,17 @@ public class SchemaDiff {
             return tableDefinition;
         }
 
+        public UniqueConstraintDef getUniqueConstraint() {
+            return uniqueConstraint;
+        }
+
         @Override
         public String toString() {
             return "SchemaChange{" +
                     "type=" + type +
                     ", tableName='" + tableName + '\'' +
-                    ", column=" + (column != null ? column.getName() : "null") +
+                    (column != null ? ", column=" + column.getName() : "") +
+                    (uniqueConstraint != null ? ", constraint=" + uniqueConstraint.getName() : "") +
                     '}';
         }
     }
@@ -127,6 +147,7 @@ public class SchemaDiff {
                 // Table exists, compare columns
                 TableDefinition actualTable = actual.get(tableName);
                 compareColumns(diff, expectedTable, actualTable);
+                compareUniqueConstraints(diff, expectedTable, actualTable);
             }
         }
 
@@ -170,6 +191,66 @@ public class SchemaDiff {
         //         diff.addChange(SchemaChange.dropColumn(tableName, actual.getColumn(columnName)));
         //     }
         // }
+    }
+
+    /**
+     * Compares unique constraints between expected and actual. Emits
+     * {@link ChangeType#ADD_UNIQUE_CONSTRAINT} for every expected constraint
+     * missing from the actual table, and
+     * {@link ChangeType#DROP_UNIQUE_CONSTRAINT} for every actual constraint
+     * that is no longer declared (column drop is disabled by default, so
+     * the diff is one-way additive here as well).
+     *
+     * <p>Databases may rename a declared index on materialization
+     * (H2 in particular appends {@code _INDEX_A} to inline
+     * {@code CONSTRAINT ... UNIQUE} clauses) and may also uppercase
+     * column names in introspected metadata (H2's default for
+     * unquoted identifiers). The comparison matches by column set
+     * (case-insensitive, order-sensitive) so the diff stays empty
+     * after a fresh migrate regardless of the database's naming
+     * choices.</p>
+     */
+    private static void compareUniqueConstraints(SchemaDiff diff, TableDefinition expected, TableDefinition actual) {
+        String tableName = expected.getName();
+
+        // Index by column set so vendor-renamed indexes still match.
+        Map<String, UniqueConstraintDef> actualByColumns = new LinkedHashMap<>();
+        for (UniqueConstraintDef uc : actual.getUniqueConstraints()) {
+            actualByColumns.put(columnsKey(uc.getColumns()), uc);
+        }
+
+        for (UniqueConstraintDef expectedUc : expected.getUniqueConstraints()) {
+            UniqueConstraintDef actualUc = actualByColumns.get(columnsKey(expectedUc.getColumns()));
+            if (actualUc != null) continue; // already materialized, regardless of name
+            diff.addChange(SchemaChange.addUniqueConstraint(tableName, expectedUc));
+        }
+
+        // Optional: emit DROP for unexpected unique constraints. Disabled
+        // to match the existing one-way additive column-diff policy; flip
+        // to true if you want strict convergence.
+        boolean dropUnexpected = false;
+        if (dropUnexpected) {
+            Set<String> expectedColumnKeys = new HashSet<>();
+            for (UniqueConstraintDef uc : expected.getUniqueConstraints()) {
+                expectedColumnKeys.add(columnsKey(uc.getColumns()));
+            }
+            for (UniqueConstraintDef actualUc : actual.getUniqueConstraints()) {
+                if (!expectedColumnKeys.contains(columnsKey(actualUc.getColumns()))) {
+                    diff.addChange(SchemaChange.dropUniqueConstraint(tableName, actualUc));
+                }
+            }
+        }
+    }
+
+    private static String columnsKey(List<String> columns) {
+        // Canonical, order-sensitive form: "col1|col2|col3" with all
+        // entries lowercased. The columns within a unique index are
+        // inherently ordered (composite index semantics), so we do not
+        // sort them - but we normalize case so the comparison survives
+        // databases that uppercase unquoted identifiers (H2 default).
+        return columns.stream()
+                .map(c -> c.toLowerCase(java.util.Locale.ROOT))
+                .collect(java.util.stream.Collectors.joining("|"));
     }
 
     /**

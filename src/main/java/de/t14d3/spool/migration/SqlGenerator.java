@@ -1,9 +1,11 @@
 package de.t14d3.spool.migration;
 
+import de.t14d3.spool.mapping.UniqueConstraintDef;
 import de.t14d3.spool.query.Dialect;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * Generates SQL statements from schema changes.
@@ -48,7 +50,8 @@ public class SqlGenerator {
             case DROP_COLUMN -> generateDropColumn(change.getTableName(), change.getColumn());
             case MODIFY_COLUMN ->
                     generateModifyColumn(change.getTableName(), change.getColumn(), change.getOldColumn());
-            default -> null;
+            case ADD_UNIQUE_CONSTRAINT -> generateAddUniqueConstraint(change.getTableName(), change.getUniqueConstraint());
+            case DROP_UNIQUE_CONSTRAINT -> generateDropUniqueConstraint(change.getTableName(), change.getUniqueConstraint());
         };
     }
 
@@ -62,6 +65,7 @@ public class SqlGenerator {
         List<String> columnDefs = new ArrayList<>();
         List<String> primaryKeys = new ArrayList<>();
         List<String> foreignKeyConstraints = new ArrayList<>();
+        List<String> uniqueKeyConstraints = new ArrayList<>();
 
         for (ColumnDefinition column : table.getColumns().values()) {
             StringBuilder colDef = new StringBuilder();
@@ -104,6 +108,19 @@ public class SqlGenerator {
             sql.append(",\n  PRIMARY KEY (").append(String.join(", ", primaryKeys)).append(")");
         }
 
+        // Add unique constraints inline. MySQL/MariaDB use the
+        // dialect-specific "UNIQUE KEY name (cols)" form; PostgreSQL/H2
+        // use the standard "CONSTRAINT name UNIQUE (cols)"; SQLite gets
+        // separate CREATE UNIQUE INDEX statements emitted by
+        // MigrationManager, since SQLite does not allow table-level
+        // UNIQUE constraints in CREATE TABLE on every supported JDBC
+        // driver and the additive path is the portable one.
+        if (dialect != Dialect.SQLITE) {
+            for (UniqueConstraintDef uc : table.getUniqueConstraints()) {
+                uniqueKeyConstraints.add(generateInlineUniqueConstraint(uc));
+            }
+        }
+
         // Add foreign key constraints
         for (ColumnDefinition column : table.getColumns().values()) {
             if (column.isForeignKey()) {
@@ -117,10 +134,77 @@ public class SqlGenerator {
             sql.append(",\n").append(String.join(",\n", foreignKeyConstraints));
         }
 
+        if (!uniqueKeyConstraints.isEmpty()) {
+            sql.append(",\n").append(String.join(",\n", uniqueKeyConstraints));
+        }
+
         sql.append("\n)");
 
         return sql.toString();
+    }
 
+    /**
+     * Emits the inline {@code UNIQUE} form for the dialect:
+     * MySQL/MariaDB: {@code UNIQUE KEY name (cols)}.
+     * PostgreSQL/H2: {@code CONSTRAINT name UNIQUE (cols)}.
+     */
+    private String generateInlineUniqueConstraint(UniqueConstraintDef uc) {
+        String cols = uc.getColumns().stream().map(this::q).collect(Collectors.joining(", "));
+        if (dialect == Dialect.MYSQL) {
+            return "  UNIQUE KEY " + q(uc.getName()) + " (" + cols + ")";
+        }
+        return "  CONSTRAINT " + q(uc.getName()) + " UNIQUE (" + cols + ")";
+    }
+
+    /**
+     * Emits {@code CREATE UNIQUE INDEX} for the additive-diff path. Used
+     * for both SQLite (where the CREATE TABLE form is omitted) and the
+     * cross-dialect case where a constraint was added to an existing
+     * table after it was created.
+     */
+    private String generateAddUniqueConstraint(String tableName, UniqueConstraintDef uc) {
+        String cols = uc.getColumns().stream().map(this::q).collect(Collectors.joining(", "));
+        // MySQL/MariaDB accept "CREATE UNIQUE INDEX name ON table (cols)".
+        // PostgreSQL/H2/SQLite/GENERIC accept the same. Idempotency is
+        // handled by the migration manager: when introspecting an existing
+        // table, a unique index with the same name is already present, so
+        // the diff does not re-emit the ADD.
+        return "CREATE UNIQUE INDEX " + q(uc.getName()) + " ON " + q(tableName) + " (" + cols + ")";
+    }
+
+    /**
+     * Returns the additional {@code CREATE UNIQUE INDEX} statements that
+     * must be issued after a CREATE TABLE for dialects (SQLite today)
+     * where the table-level CREATE form omits unique constraints. The
+     * returned list is empty for dialects that emit unique constraints
+     * inline; callers that mix dialects on the same connection can
+     * always call this and execute the returned statements unconditionally
+     * (CREATE UNIQUE INDEX is a no-op for an index that already exists
+     * when wrapped in IF NOT EXISTS, which most drivers do NOT support,
+     * so the migration manager's introspection is the source of truth
+     * for "already exists" and this helper only emits the additive case).
+     */
+    public List<String> generatePostCreateTableStatements(TableDefinition table) {
+        if (dialect == Dialect.SQLITE) {
+            List<String> statements = new ArrayList<>();
+            for (UniqueConstraintDef uc : table.getUniqueConstraints()) {
+                statements.add(generateAddUniqueConstraint(table.getName(), uc));
+            }
+            return statements;
+        }
+        return List.of();
+    }
+
+    /**
+     * Emits {@code DROP INDEX}. MySQL/MariaDB require the table-qualified
+     * form {@code DROP INDEX name ON table}; PostgreSQL/SQLite/H2 accept
+     * the unqualified form.
+     */
+    private String generateDropUniqueConstraint(String tableName, UniqueConstraintDef uc) {
+        if (dialect == Dialect.MYSQL) {
+            return "DROP INDEX " + q(uc.getName()) + " ON " + q(tableName);
+        }
+        return "DROP INDEX " + q(uc.getName());
     }
 
     /**

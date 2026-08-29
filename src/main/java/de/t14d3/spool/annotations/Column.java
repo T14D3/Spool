@@ -39,4 +39,14 @@ public @interface Column {
      * If not specified or empty, the type is inferred from the Java field type.
      */
     String type() default "";
+
+    /**
+     * Marks the column as having a single-column unique constraint.
+     *
+     * <p>Equivalent to a table-level {@link UniqueConstraint} with a single
+     * column entry; the migration manager picks a stable index name. Use
+     * {@link Table#uniqueConstraints()} instead when you need a composite
+     * key or a specific index name.</p>
+     */
+    boolean unique() default false;
 }

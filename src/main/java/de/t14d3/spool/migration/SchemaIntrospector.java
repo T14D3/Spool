@@ -10,6 +10,7 @@ import de.t14d3.spool.annotations.ManyToMany;
 import de.t14d3.spool.annotations.ManyToOne;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.mapping.TypeMapper;
+import de.t14d3.spool.mapping.UniqueConstraintDef;
 import de.t14d3.spool.query.Dialect;
 
 import java.lang.reflect.Field;
@@ -191,6 +192,7 @@ public class SchemaIntrospector {
 
             TableDefinition table = new TableDefinition(actualTable);
             for (ColumnDefinition c : columns) table.addColumn(c);
+            collectUniqueConstraints(metaData, foundSchema, actualTable, table);
             return table;
 
         } catch (SQLException e) {
@@ -302,7 +304,112 @@ public class SchemaIntrospector {
         if (columns.isEmpty()) return null;
         TableDefinition table = new TableDefinition(tableName);
         for (ColumnDefinition c : columns) table.addColumn(c);
+        collectSqliteUniqueConstraints(tableName, table);
         return table;
+    }
+
+    /**
+     * Reads existing unique indexes for a table from JDBC metadata
+     * ({@link DatabaseMetaData#getIndexInfo}) and adds them to
+     * {@code table}. The primary key is excluded since it is already
+     * tracked via {@code getPrimaryKeys}, and drivers that surface the
+     * primary-key index here (H2) would otherwise produce spurious
+     * diff entries.
+     *
+     * <p>The order of columns within each index follows the result set's
+     * {@code ORDINAL_POSITION}, which is what
+     * {@code CREATE UNIQUE INDEX} would also produce.</p>
+     */
+    private void collectUniqueConstraints(DatabaseMetaData metaData, String foundSchema,
+                                          String actualTable, TableDefinition table) throws SQLException {
+        // Collect the primary-key columns first so we can skip the
+        // primary-key index if the driver surfaces it here.
+        java.util.Set<String> pkColumnsLower = new java.util.HashSet<>();
+        try (ResultSet pkRs = metaData.getPrimaryKeys(null, foundSchema, actualTable)) {
+            while (pkRs.next()) {
+                String col = pkRs.getString("COLUMN_NAME");
+                if (col != null) pkColumnsLower.add(col.toLowerCase());
+            }
+        } catch (SQLException ignored) {
+            // If PK metadata is unavailable, we still proceed; the
+            // PK-index filter is best-effort.
+        }
+
+        try (ResultSet idxRs = metaData.getIndexInfo(null, foundSchema, actualTable, true, false)) {
+            java.util.Map<String, java.util.List<String>> indexes = new java.util.LinkedHashMap<>();
+            while (idxRs.next()) {
+                String idxName = idxRs.getString("INDEX_NAME");
+                if (idxName == null) continue; // table-level statistics row
+                String colName = idxRs.getString("COLUMN_NAME");
+                if (colName == null) continue;
+                indexes.computeIfAbsent(idxName, k -> new java.util.ArrayList<>()).add(colName);
+            }
+            for (var e : indexes.entrySet()) {
+                // Skip indexes whose only column is the primary key.
+                // H2 reports the primary-key index even with uniqueOnly=true.
+                if (isPrimaryKeyIndex(e.getKey(), e.getValue(), pkColumnsLower)) continue;
+                table.addUniqueConstraint(new UniqueConstraintDef(e.getKey(), e.getValue()));
+            }
+        } catch (SQLException ignored) {
+            // Some drivers do not support getIndexInfo reliably (older
+            // H2 modes, certain MySQL forks). The table can still be
+            // introspected for columns; unique constraints just won't be
+            // detected and the diff will treat them as new.
+        }
+    }
+
+    /**
+     * Best-effort heuristic for skipping primary-key indexes that some
+     * drivers (notably H2) surface through {@code getIndexInfo}. Matches
+     * H2's {@code PRIMARY_KEY_<N>} naming convention and single-column
+     * indexes over a primary-key column.
+     */
+    private static boolean isPrimaryKeyIndex(String idxName, java.util.List<String> columns,
+                                            java.util.Set<String> pkColumnsLower) {
+        String upper = idxName.toUpperCase(java.util.Locale.ROOT);
+        if (upper.startsWith("PRIMARY_KEY_") || upper.equals("PRIMARY_KEY")) {
+            return true;
+        }
+        if (columns.size() == 1 && pkColumnsLower.contains(columns.get(0).toLowerCase(java.util.Locale.ROOT))) {
+            // Single-column index on a PK column is the implicit
+            // primary-key index, even if the driver named it differently
+            // (some drivers omit the "PRIMARY_KEY_" prefix).
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Reads unique indexes for a SQLite table via
+     * {@code PRAGMA index_list} + {@code PRAGMA index_info}, since
+     * {@code DatabaseMetaData.getIndexInfo} is not always reliable for
+     * SQLite. The auto-generated primary-key index
+     * ({@code sqlite_autoindex_<table>_1}) is excluded.
+     */
+    private void collectSqliteUniqueConstraints(String tableName, TableDefinition table) throws SQLException {
+        String listPragma = "PRAGMA index_list(\"" + tableName.replace("\"", "\"\"") + "\")";
+        try (PreparedStatement ps = connection.prepareStatement(listPragma);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                String idxName = rs.getString("name");
+                Integer isUnique = (Integer) rs.getObject("unique");
+                if (idxName == null || isUnique == null || isUnique == 0) continue;
+                if (idxName.startsWith("sqlite_autoindex_")) continue;
+
+                String infoPragma = "PRAGMA index_info(\"" + idxName.replace("\"", "\"\"") + "\")";
+                java.util.List<String> cols = new java.util.ArrayList<>();
+                try (PreparedStatement ips = connection.prepareStatement(infoPragma);
+                     ResultSet irs = ips.executeQuery()) {
+                    while (irs.next()) {
+                        String col = irs.getString("name");
+                        if (col != null) cols.add(col);
+                    }
+                }
+                if (!cols.isEmpty()) {
+                    table.addUniqueConstraint(new UniqueConstraintDef(idxName, cols));
+                }
+            }
+        }
     }
 
     // -----------------------
@@ -475,6 +582,15 @@ public class SchemaIntrospector {
             
             ColumnDefinition column = builder.build();
             table.addColumn(column);
+        }
+
+        // Carry the unique constraints declared on the entity (single-column
+        // @Column(unique=true) entries and composite @Table(uniqueConstraints)
+        // entries) into the TableDefinition. The SQL generator emits them
+        // inside CREATE TABLE on MySQL/MariaDB/PostgreSQL/H2; SQLite gets
+        // separate CREATE UNIQUE INDEX statements after the table.
+        for (de.t14d3.spool.mapping.UniqueConstraintDef uc : metadata.getUniqueConstraints()) {
+            table.addUniqueConstraint(uc);
         }
 
         return table;

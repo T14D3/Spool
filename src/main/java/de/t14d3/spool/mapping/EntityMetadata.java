@@ -6,6 +6,7 @@ import de.t14d3.spool.annotations.Id;
 import de.t14d3.spool.annotations.JoinColumn;
 import de.t14d3.spool.annotations.OneToMany;
 import de.t14d3.spool.annotations.Table;
+import de.t14d3.spool.annotations.UniqueConstraint;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -26,10 +27,11 @@ public class EntityMetadata {
     private final Map<String, Field> columnToField;
     private final Map<Field, String> fieldToColumn;
     private final Map<Field, String> fieldToColumnType;
+    private final List<UniqueConstraintDef> uniqueConstraints;
 
     private EntityMetadata(Class<?> entityClass) {
         this.entityClass = entityClass;
-        
+
         // Validate entity annotation
         if (!entityClass.isAnnotationPresent(Entity.class)) {
             throw new IllegalArgumentException("Class " + entityClass.getName() + " is not annotated with @Entity");
@@ -44,6 +46,7 @@ public class EntityMetadata {
         this.columnToField = new HashMap<>();
         this.fieldToColumn = new HashMap<>();
         this.fieldToColumnType = new HashMap<>();
+        this.uniqueConstraints = new ArrayList<>();
         Field foundIdField = null;
         boolean foundAutoIncrement = false;
 
@@ -109,6 +112,47 @@ public class EntityMetadata {
 
         this.idField = foundIdField;
         this.autoIncrement = foundAutoIncrement;
+
+        // Collect single-column unique constraints (@Column(unique = true)).
+        for (Field field : fields) {
+            Column column = field.getAnnotation(Column.class);
+            if (column == null || !column.unique()) continue;
+            String columnName = fieldToColumn.get(field);
+            if (columnName == null) continue;
+            String constraintName = deriveSingleColumnUniqueName(tableName, columnName);
+            uniqueConstraints.add(new UniqueConstraintDef(constraintName, List.of(columnName)));
+        }
+
+        // Collect table-level composite unique constraints (@Table(uniqueConstraints = ...)).
+        if (tableAnnotation != null) {
+            for (UniqueConstraint uc : tableAnnotation.uniqueConstraints()) {
+                String name = uc.name();
+                if (name == null || name.isBlank()) {
+                    name = deriveCompositeUniqueName(tableName, uc.columns());
+                }
+                uniqueConstraints.add(new UniqueConstraintDef(name, List.of(uc.columns())));
+            }
+        }
+    }
+
+    /**
+     * Derives a stable, deterministic index name for a single-column
+     * {@code @Column(unique = true)} entry. The same column always produces
+     * the same name, so a re-deploy never tries to re-create the index.
+     */
+    private static String deriveSingleColumnUniqueName(String tableName, String columnName) {
+        return "uniq_" + tableName + "_" + columnName;
+    }
+
+    /**
+     * Derives a stable, deterministic index name for a composite
+     * {@code @Table(uniqueConstraints = ...)} entry that did not specify a
+     * name. Columns are sorted to keep the name stable across reorderings.
+     */
+    private static String deriveCompositeUniqueName(String tableName, String[] columns) {
+        String[] sorted = columns.clone();
+        java.util.Arrays.sort(sorted);
+        return "uniq_" + tableName + "_" + String.join("_", sorted);
     }
 
     /**
@@ -156,6 +200,15 @@ public class EntityMetadata {
      */
     public String getColumnType(Field field) {
         return fieldToColumnType.get(field);
+    }
+
+    /**
+     * Returns the unique constraints declared on the entity: single-column
+     * entries from {@code @Column(unique = true)} and composite entries from
+     * {@code @Table(uniqueConstraints = ...)}.
+     */
+    public List<UniqueConstraintDef> getUniqueConstraints() {
+        return Collections.unmodifiableList(uniqueConstraints);
     }
 
     /**

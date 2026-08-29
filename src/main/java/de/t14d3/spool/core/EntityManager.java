@@ -314,6 +314,78 @@ public class EntityManager {
     }
 
     /**
+     * Removes all pending operations targeting {@code entity} from the
+     * insert and update queues. Use this when an operation that has
+     * been enqueued via {@link #persist(Object)} is no longer wanted
+     * (typically because a concurrent writer on another node won a
+     * race that the application caught via a
+     * {@link de.t14d3.spool.UniqueConstraintViolationException} and is
+     * replacing it with a fresh read).
+     *
+     * <p>The matching is identity-based, not {@code equals()}-based: an
+     * entity instance is matched by the exact reference held at the
+     * call site. This is the right semantics for the "drop my own
+     * orphan" use case, where the caller still has the original
+     * reference. Concurrent enqueues of other entities are not
+     * affected; concurrent enqueues of the same reference are racy
+     * (drained by one thread, observed by another) but that is the
+     * usual behavior of lock-free queues and is benign: the second
+     * call is a no-op.</p>
+     *
+     * <p>This is the correct companion to a unique-constraint
+     * retry: when a concurrent insert collides, the local
+     * enqueued insert is no longer wanted and must be removed
+     * before the next {@link #flush()} runs, otherwise the
+     * constraint fires again on the same row.</p>
+     */
+    public void cancelPending(Object entity) {
+        if (entity == null) return;
+        removeByIdentity(pendingInserts, entity);
+        removeByIdentity(pendingUpdates, entity);
+        // Also detach from the identity map so a subsequent find on the
+        // same id does not return the orphan. Detach is a no-op for
+        // entities the EM never managed.
+        EntityMetadata metadata;
+        try {
+            metadata = EntityMetadata.of(entity.getClass());
+        } catch (Exception ignored) {
+            return;
+        }
+        Object id = metadata.getIdValue(entity);
+        if (id != null) {
+            EntityKey key = new EntityKey(entity.getClass(), id);
+            identityMap.remove(key);
+            originalValues.remove(key);
+        }
+    }
+
+    /**
+     * Identity-based drain of a {@link java.util.concurrent.ConcurrentLinkedQueue}.
+     * {@link java.util.Queue#remove(Object)} uses {@code equals} which
+     * is the wrong equality for entity references (Spool's cascading
+     * detach path adds entries to {@code detachedEntities} via
+     * identity-set semantics, so the rest of the EM already uses
+     * identity equality - the queues just haven't been updated).
+     */
+    private static void removeByIdentity(java.util.concurrent.ConcurrentLinkedQueue<Object> queue, Object target) {
+        if (queue.isEmpty()) return;
+        // Collect-then-requeue: ConcurrentLinkedQueue does not expose a
+        // "remove by identity" operation, so drain into a fresh list,
+        // skip the target, and put the rest back. Safe under concurrent
+        // enqueues: anything added to the queue during the drain stays
+        // put; anything added to the original queue that is now in
+        // the kept list is preserved; the second-pass queue.addAll is
+        // a no-op for any item still in the original queue.
+        java.util.List<Object> kept = new java.util.ArrayList<>(queue.size());
+        while (true) {
+            Object o = queue.poll();
+            if (o == null) break;
+            if (o != target) kept.add(o);
+        }
+        queue.addAll(kept);
+    }
+
+    /**
      * Checks whether an entity with the given class and id is currently managed
      * (present in the identity map) without performing any I/O.
      * <p>
@@ -545,10 +617,39 @@ public class EntityManager {
                     }
                 }
 
+                // A unique-key violation is a recoverable application-level
+                // signal: re-find + update. Surface it as the typed
+                // exception so callers do not have to inspect vendor error
+                // codes themselves. Other exceptions keep the previous
+                // RuntimeException envelope (cause chain preserved).
+                SQLException uniqueCause = findUniqueCause(e);
+                if (uniqueCause != null) {
+                    de.t14d3.spool.SpoolExceptions.throwUniqueOrRethrow(uniqueCause, null);
+                }
                 throw new RuntimeException(
                     "Flush failed" + (transactionActive ? " (transaction rolled back)" : ""), e);
             }
         }
+    }
+
+    /**
+     * Walks an exception's cause chain to find the first {@link SQLException}.
+     * Returns null when the chain has no {@link SQLException} (e.g. a
+     * pre-validation failure in the executor).
+     */
+    private static SQLException findUniqueCause(Throwable t) {
+        Throwable current = t;
+        int hops = 0;
+        while (current != null && hops++ < 16) {
+            if (current instanceof SQLException sql) {
+                return sql;
+            }
+            if (current.getCause() == current) {
+                return null;
+            }
+            current = current.getCause();
+        }
+        return null;
     }
 
     /**

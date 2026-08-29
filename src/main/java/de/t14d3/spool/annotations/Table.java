@@ -23,4 +23,12 @@ public @interface Table {
      * The name of the database table.
      */
     String name();
+
+    /**
+     * Composite unique constraints declared at the table level. Each entry is
+     * materialized as a {@code UNIQUE} index during schema migration. Inserting
+     * a row that duplicates an existing one across the listed columns raises a
+     * {@link de.t14d3.spool.UniqueConstraintViolationException}.
+     */
+    UniqueConstraint[] uniqueConstraints() default {};
 }
