@@ -3,6 +3,7 @@ package de.t14d3.spool.test;
 import de.t14d3.spool.annotations.Column;
 import de.t14d3.spool.annotations.Entity;
 import de.t14d3.spool.annotations.Id;
+import de.t14d3.spool.annotations.JoinColumn;
 import de.t14d3.spool.annotations.ManyToMany;
 import de.t14d3.spool.annotations.OneToMany;
 import de.t14d3.spool.annotations.OneToOne;
@@ -12,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -71,11 +73,31 @@ public class MappingValidationTest {
     }
 
     @Test
-    void oneToOneFailsAtMetadataBuild() {
+    void joinColumnOnMappedByOneToManyFailsAtMetadataBuild() {
         IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
-                () -> EntityMetadata.of(OneToOneOwner.class));
-        assertTrue(ex.getMessage().contains("target"), ex.getMessage());
-        assertTrue(ex.getMessage().contains("@OneToOne"), ex.getMessage());
+                () -> EntityMetadata.of(MappedByWithJoinColumnOwner.class));
+        assertTrue(ex.getMessage().contains("both mappedBy"), ex.getMessage());
+    }
+
+    @Test
+    void oneToOneMappedByMustExistOnTarget() {
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> EntityMetadata.of(MissingOneToOneMappedByOwner.class));
+        assertTrue(ex.getMessage().contains("partner"), ex.getMessage());
+    }
+
+    @Test
+    void oneToOneMappedByMustPointAtOwningSide() {
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> EntityMetadata.of(InverseOfInverseOneToOneOwner.class));
+        assertTrue(ex.getMessage().contains("owning side"), ex.getMessage());
+    }
+
+    @Test
+    void owningOneToOneIsMapped() {
+        EntityMetadata metadata = EntityMetadata.of(OneToOneOwner.class);
+        assertEquals("target_id",
+                metadata.getColumnName(EntityMetadata.findField(OneToOneOwner.class, "target")));
     }
 
     @Entity
@@ -157,6 +179,17 @@ public class MappingValidationTest {
     }
 
     @Entity
+    static class MappedByWithJoinColumnOwner {
+        @Id(autoIncrement = true)
+        @Column(name = "id")
+        private Long id;
+
+        @OneToMany(targetEntity = Target.class, mappedBy = "owner")
+        @JoinColumn(name = "owner_id")
+        private List<Target> children = new ArrayList<>();
+    }
+
+    @Entity
     static class OneToOneOwner {
         @Id(autoIncrement = true)
         @Column(name = "id")
@@ -164,5 +197,35 @@ public class MappingValidationTest {
 
         @OneToOne
         private Target target;
+    }
+
+    @Entity
+    static class MissingOneToOneMappedByOwner {
+        @Id(autoIncrement = true)
+        @Column(name = "id")
+        private Long id;
+
+        @OneToOne(mappedBy = "missing")
+        private Target partner;
+    }
+
+    @Entity
+    static class InverseOneToOneTarget {
+        @Id(autoIncrement = true)
+        @Column(name = "id")
+        private Long id;
+
+        @OneToOne(mappedBy = "owner")
+        private InverseOfInverseOneToOneOwner owner;
+    }
+
+    @Entity
+    static class InverseOfInverseOneToOneOwner {
+        @Id(autoIncrement = true)
+        @Column(name = "id")
+        private Long id;
+
+        @OneToOne(mappedBy = "owner")
+        private InverseOneToOneTarget owner;
     }
 }

@@ -52,6 +52,7 @@ public class EntityManager implements AutoCloseable {
     private final ThreadLocal<Set<Object>> cascadingDetachStack;
     private final ThreadLocal<Set<Object>> cascadingRefreshStack;
     private final Set<ManyToManyDirtyKey> dirtyManyToMany;
+    private final Set<OneToManyDirtyKey> dirtyOneToMany;
     private final Set<Object> detachedEntities;
     private CacheProvider cacheProvider;
     private CacheEventSink cacheEventSink;
@@ -75,6 +76,7 @@ public class EntityManager implements AutoCloseable {
         this.cascadingDetachStack = ThreadLocal.withInitial(() -> Collections.newSetFromMap(new IdentityHashMap<>()));
         this.cascadingRefreshStack = ThreadLocal.withInitial(() -> Collections.newSetFromMap(new IdentityHashMap<>()));
         this.dirtyManyToMany = Collections.newSetFromMap(new ConcurrentHashMap<>());
+        this.dirtyOneToMany = Collections.newSetFromMap(new ConcurrentHashMap<>());
         this.detachedEntities = Collections.newSetFromMap(new IdentityHashMap<>());
         this.cacheProvider = new NoOpCacheProvider();
         this.cacheEventSink = new NoOpCacheEventSink();
@@ -589,6 +591,7 @@ public class EntityManager implements AutoCloseable {
 
                     EntityMetadata meta = EntityMetadata.of(entity.getClass());
                     deleteManyToManyJoinRows(entity, meta);
+                    unlinkForeignKeyOneToMany(entity, meta);
                     relationshipManager.cascadeRemove(entity, meta);
 
                     // Capture any cascade-triggered deletes.
@@ -697,6 +700,19 @@ public class EntityManager implements AutoCloseable {
                     if (entity != null && !insertedEntities.contains(entity) && !updateSet.contains(entity)) {
                         syncManyToManyJoinRows(entity, EntityMetadata.of(entity.getClass()), false);
                     }
+                }
+
+                // ── Sync unidirectional OneToMany FK columns ─────────────
+                // The FK lives on the target table. Tracked wrappers are only
+                // diffed when marked dirty; a replaced (untracked) collection
+                // is always diffed so direct field assignment is not lost.
+                Set<Object> syncCandidates = Collections.newSetFromMap(new IdentityHashMap<>());
+                syncCandidates.addAll(identityMap.values());
+                for (Object entity : syncCandidates) {
+                    if (entity == null || deleteSet.contains(entity)) {
+                        continue;
+                    }
+                    syncForeignKeyOneToMany(entity, EntityMetadata.of(entity.getClass()));
                 }
 
                 publishCacheEvents(cacheEvents);
@@ -838,6 +854,7 @@ public class EntityManager implements AutoCloseable {
         relationshipManager.hydrateEagerSingleRefs(entity, metadata);
         relationshipManager.hydrateEagerCollections(entity, metadata);
         relationshipManager.hydrateEagerManyToMany(entity, metadata);
+        relationshipManager.hydrateEagerInverseOneToOne(entity, metadata);
 
         // Ensure it's in identity map
         EntityKey key = new EntityKey(entity.getClass(), id);
@@ -1014,6 +1031,7 @@ public class EntityManager implements AutoCloseable {
         // no longer managed, so a later reload with the same class + id would
         // otherwise trigger a spurious join-table sync on the next flush.
         dirtyManyToMany.clear();
+        dirtyOneToMany.clear();
     }
 
     /** Atomically drain a concurrent queue (discard all items). */
@@ -1162,6 +1180,30 @@ public class EntityManager implements AutoCloseable {
             return;
         }
         dirtyManyToMany.add(new ManyToManyDirtyKey(entity.getClass(), id, field.getName()));
+    }
+
+    /**
+     * Marks a unidirectional {@code @OneToMany} (FK column on the target
+     * table) as mutated so {@code flush()} syncs the FK column.
+     */
+    void markOneToManyDirty(Object entity, Field field) {
+        if (entity == null || field == null) {
+            return;
+        }
+        EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
+            return;
+        }
+        dirtyOneToMany.add(new OneToManyDirtyKey(entity.getClass(), id, field.getName()));
+    }
+
+    private boolean isOneToManyDirty(Class<?> entityClass, EntityId id, Field field) {
+        return dirtyOneToMany.contains(new OneToManyDirtyKey(entityClass, id, field.getName()));
+    }
+
+    private void clearOneToManyDirty(Class<?> entityClass, EntityId id, Field field) {
+        dirtyOneToMany.remove(new OneToManyDirtyKey(entityClass, id, field.getName()));
     }
 
     private boolean isManyToManyDirty(Class<?> entityClass, EntityId id, Field field) {
@@ -1541,6 +1583,7 @@ public class EntityManager implements AutoCloseable {
         relationshipManager.hydrateEagerSingleRefs(entity, metadata);
         relationshipManager.hydrateEagerCollections(entity, metadata);
         relationshipManager.hydrateEagerManyToMany(entity, metadata);
+        relationshipManager.hydrateEagerInverseOneToOne(entity, metadata);
         relationshipManager.installLazyCollections(entity, metadata);
         // Fire @PreLoad before the dirty-check baseline is captured so state
         // set by the callback is treated as loaded state, not an update.
@@ -1581,7 +1624,7 @@ public class EntityManager implements AutoCloseable {
 
         Map<String, Object> values = new HashMap<>();
         for (Field field : metadata.getFields()) {
-            if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
+            if (EntityMetadata.isOwningToOne(field)) {
                 Object related = metadata.getFieldValue(entity, field);
                 if (related == null) {
                     values.put(field.getName(), null);
@@ -1602,7 +1645,7 @@ public class EntityManager implements AutoCloseable {
         Map<Field, Object> snapshot = new HashMap<>();
         for (Field field : metadata.getFields()) {
             if (metadata.isIdField(field)) continue;
-            if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
+            if (EntityMetadata.isOwningToOne(field)) {
                 Object related = metadata.getFieldValue(entity, field);
                 if (related == null) {
                     snapshot.put(field, null);
@@ -1637,14 +1680,14 @@ public class EntityManager implements AutoCloseable {
         T entity = (T) metadata.newInstance();
         for (Field field : metadata.getFields()) {
             Object v = snapshot.fieldValues().get(field.getName());
-            if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
+            if (EntityMetadata.isOwningToOne(field)) {
                 if (v == null) {
                     metadata.setFieldValue(entity, field, null);
                 } else {
                     EntityMetadata relatedMeta = EntityMetadata.of(field.getType());
                     if (relatedMeta.isCompositeId()) {
                         throw new UnsupportedOperationException(
-                                "@ManyToOne target with a composite id is not supported: "
+                                "Single-reference target with a composite id is not supported: "
                                         + field.getType().getName());
                     }
                     Object related = relatedMeta.newInstance();
@@ -1678,6 +1721,8 @@ public class EntityManager implements AutoCloseable {
     }
 
     private record ManyToManyDirtyKey(Class<?> entityClass, EntityId id, String fieldName) {}
+
+    private record OneToManyDirtyKey(Class<?> entityClass, EntityId id, String fieldName) {}
 
     Set<Object> loadManyToManyOtherIds(ManyToManyJoinTable join, Object thisId, Class<?> otherIdType) {
         String sql = "SELECT " + dialect.quoteIdentifier(join.otherColumn()) +
@@ -1716,10 +1761,13 @@ public class EntityManager implements AutoCloseable {
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
         relationshipManager.prepareRelationships(entity, metadata);
 
-        // Ensure referenced entities for single-ref relationships exist first.
+        // Ensure referenced entities for owning single-reference relationships
+        // exist first. Inverse @OneToOne has no FK here, so the referenced
+        // owner is queued after this row and picks up the generated id.
         for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
-            if (relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_ONE
-                    && relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_ONE) {
+            boolean singleRef = relationship.relationshipType() == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_ONE
+                    || relationship.relationshipType() == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_ONE;
+            if (!singleRef || !relationship.isOwningSide()) {
                 continue;
             }
 
@@ -1870,6 +1918,167 @@ public class EntityManager implements AutoCloseable {
             }
 
             clearManyToManyDirty(entity.getClass(), entityId, relationship.field());
+        }
+    }
+
+    private Set<Object> loadForeignKeyChildIds(EntityMetadata childMeta, String fkColumn, Object ownerId) {
+        Query q = Query.select(dialect, childMeta.getIdColumnName())
+                .from(childMeta.getTableName())
+                .where(dialect.quoteIdentifier(fkColumn) + " = ?", ownerId)
+                .build();
+        Set<Object> ids = new LinkedHashSet<>();
+        try (PreparedStatement stmt = connection.prepareStatement(q.getSql())) {
+            SqlExecutor.setParameters(stmt, q.getParameters());
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    Object raw = rs.getObject(1);
+                    ids.add(de.t14d3.spool.mapping.TypeMapper.convertToJavaType(raw, childMeta.getIdField().getType()));
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to load child ids for " + childMeta.getTableName() + "." + fkColumn, e);
+        }
+        return ids;
+    }
+
+    private Query updateChildForeignKey(EntityMetadata childMeta, String fkColumn, Object value, Object childId) {
+        return Query.update(dialect, childMeta.getTableName())
+                .set(fkColumn, value)
+                .where(dialect.quoteIdentifier(childMeta.getIdColumnName()) + " = ?", childId)
+                .build();
+    }
+
+    private void syncForeignKeyOneToManyAssociation(
+            Object entity,
+            EntityMetadata metadata,
+            de.t14d3.spool.mapping.RelationshipMapping relationship,
+            Object ownerId) {
+        EntityMetadata childMeta = EntityMetadata.of(relationship.targetEntity());
+        if (childMeta.isCompositeId()) {
+            throw new UnsupportedOperationException(
+                    "Unidirectional @OneToMany target with a composite id is not supported: "
+                            + childMeta.getEntityClass().getName());
+        }
+        String fkColumn = relationship.joinColumn();
+        if (fkColumn == null || fkColumn.isBlank()) {
+            throw new IllegalStateException("Unidirectional @OneToMany without a join column: "
+                    + metadata.getEntityClass().getName() + "." + relationship.field().getName());
+        }
+
+        Set<Object> existing = loadForeignKeyChildIds(childMeta, fkColumn, ownerId);
+        Set<Object> desired = new LinkedHashSet<>();
+        Object value = metadata.getFieldValue(entity, relationship.field());
+        if (value instanceof Collection<?> collection) {
+            for (Object child : collection) {
+                if (child == null) {
+                    continue;
+                }
+                EntityMetadata childInstanceMeta = EntityMetadata.of(child.getClass());
+                if (childInstanceMeta.isCompositeId()) {
+                    throw new UnsupportedOperationException(
+                            "Unidirectional @OneToMany child with a composite id is not supported: "
+                                    + child.getClass().getName());
+                }
+                EntityId childId = childInstanceMeta.getEntityId(child);
+                if (!childId.isComplete()) {
+                    throw new IllegalStateException("Unidirectional @OneToMany child has no id at flush: "
+                            + child.getClass().getName() + "; persist it or cascade from "
+                            + metadata.getEntityClass().getName() + "." + relationship.field().getName());
+                }
+                desired.add(childId.singleValue());
+            }
+        }
+
+        Set<Object> toAdd = new LinkedHashSet<>(desired);
+        toAdd.removeAll(existing);
+        Set<Object> toRemove = new LinkedHashSet<>(existing);
+        toRemove.removeAll(desired);
+
+        for (Object childId : toRemove) {
+            Query q = updateChildForeignKey(childMeta, fkColumn, null, childId);
+            executor.executeUpdate(q.getSql(), q.getParameters());
+        }
+        for (Object childId : toAdd) {
+            Query q = updateChildForeignKey(childMeta, fkColumn, ownerId, childId);
+            executor.executeUpdate(q.getSql(), q.getParameters());
+        }
+    }
+
+    private void unlinkForeignKeyOneToMany(Object entity, EntityMetadata metadata) {
+        EntityId entityId = metadata.getEntityId(entity);
+        if (!entityId.isComplete() || metadata.isCompositeId()) {
+            return;
+        }
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_MANY
+                    || !relationship.isOwningSide()) {
+                continue;
+            }
+            String fkColumn = relationship.joinColumn();
+            if (fkColumn == null || fkColumn.isBlank()) {
+                continue;
+            }
+            clearOneToManyDirty(metadata.getEntityClass(), entityId, relationship.field());
+            EntityMetadata childMeta = EntityMetadata.of(relationship.targetEntity());
+            if (childMeta.isCompositeId()) {
+                throw new UnsupportedOperationException(
+                        "Unidirectional @OneToMany target with a composite id is not supported: "
+                                + childMeta.getEntityClass().getName());
+            }
+            Query q = Query.update(dialect, childMeta.getTableName())
+                    .set(fkColumn, null)
+                    .where(dialect.quoteIdentifier(fkColumn) + " = ?", entityId.singleValue())
+                    .build();
+            executor.executeUpdate(q.getSql(), q.getParameters());
+        }
+    }
+
+    /**
+     * True when the entity declares at least one unidirectional
+     * {@code @OneToMany}; used to skip the whole FK-sync pass for unrelated
+     * entities.
+     */
+    private boolean declaresOwningOneToMany(EntityMetadata metadata) {
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (relationship.relationshipType() == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_MANY
+                    && relationship.isOwningSide()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Sync the FK columns owned by unidirectional {@code @OneToMany}
+     * associations on {@code entity}. Tracked lazy/eager wrappers are skipped
+     * unless marked dirty; an untracked (replaced) collection is always
+     * diffed.
+     */
+    private void syncForeignKeyOneToMany(Object entity, EntityMetadata metadata) {
+        if (entity == null || !declaresOwningOneToMany(metadata)) {
+            return;
+        }
+        EntityId entityId = metadata.getEntityId(entity);
+        if (!entityId.isComplete()) {
+            return;
+        }
+        if (metadata.isCompositeId()) {
+            throw new UnsupportedOperationException(
+                    "Unidirectional @OneToMany with a composite-id owner is not supported: "
+                            + metadata.getEntityClass().getName());
+        }
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_MANY
+                    || !relationship.isOwningSide()) {
+                continue;
+            }
+            Object value = metadata.getFieldValue(entity, relationship.field());
+            if (!isOneToManyDirty(metadata.getEntityClass(), entityId, relationship.field())
+                    && RelationshipManager.isMutationTracked(value)) {
+                continue;
+            }
+            syncForeignKeyOneToManyAssociation(entity, metadata, relationship, entityId.singleValue());
+            clearOneToManyDirty(metadata.getEntityClass(), entityId, relationship.field());
         }
     }
 

@@ -1,6 +1,5 @@
 package de.t14d3.spool.core;
 
-import de.t14d3.spool.annotations.ManyToOne;
 import de.t14d3.spool.mapping.EntityId;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.query.Dialect;
@@ -278,7 +277,7 @@ public class SqlExecutor {
 
             cols.add(metadata.getColumnName(field));
 
-            if (field.isAnnotationPresent(ManyToOne.class)) {
+            if (EntityMetadata.isOwningToOne(field)) {
                 Object related = metadata.getFieldValue(entity, field);
                 if (related == null) {
                     vals.add(null);
@@ -322,7 +321,7 @@ public class SqlExecutor {
         if (value == null) {
             return null;
         }
-        if (field.isAnnotationPresent(ManyToOne.class)) {
+        if (EntityMetadata.isOwningToOne(field)) {
             EntityMetadata relatedMeta = EntityMetadata.of(value.getClass());
             if (relatedMeta.isCompositeId()) {
                 return value;
@@ -461,16 +460,17 @@ public class SqlExecutor {
                 raw = de.t14d3.spool.mapping.TypeMapper.convertToJavaType(raw, field.getType());
             }
 
-            // For ManyToOne we currently do not eagerly load related entity;
-            // instead store an id-only stub entity. EntityManager may later eagerly hydrate it.
-            if (field.isAnnotationPresent(ManyToOne.class)) {
+            // For owning single references we do not eagerly load the related
+            // entity; instead store an id-only stub entity. EntityManager may
+            // later eagerly hydrate it.
+            if (EntityMetadata.isOwningToOne(field)) {
                 if (raw == null) {
                     metadata.setFieldValue(entity, field, null);
                 } else {
                     EntityMetadata relatedMeta = EntityMetadata.of(field.getType());
                     if (relatedMeta.isCompositeId()) {
                         throw new UnsupportedOperationException(
-                                "@ManyToOne target with a composite id is not supported: "
+                                "Single-reference target with a composite id is not supported: "
                                         + field.getType().getName());
                     }
                     Object related = relatedMeta.newInstance();

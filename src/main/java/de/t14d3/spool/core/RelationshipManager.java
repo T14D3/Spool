@@ -303,13 +303,18 @@ public class RelationshipManager {
         // OneToMany
         if (field.isAnnotationPresent(OneToMany.class)) {
             OneToMany annotation = field.getAnnotation(OneToMany.class);
+            de.t14d3.spool.annotations.JoinColumn joinColumn =
+                    field.getAnnotation(de.t14d3.spool.annotations.JoinColumn.class);
+            String fkColumn = (annotation.mappedBy() == null || annotation.mappedBy().isBlank())
+                    && joinColumn != null ? joinColumn.name() : "";
             return new RelationshipMapping(
                     field,
                     annotation.targetEntity(),
                     RelationshipMapping.RelationshipType.ONE_TO_MANY,
                     annotation.mappedBy(),
                     annotation.fetch(),
-                    annotation.cascade()
+                    annotation.cascade(),
+                    fkColumn
             );
         }
 
@@ -446,6 +451,73 @@ public class RelationshipManager {
     }
 
     /**
+     * Eagerly hydrate inverse-side {@code @OneToOne} references (the side with
+     * {@code mappedBy} set): no FK column lives on this table, so the owner row
+     * is looked up by its FK to this entity.
+     */
+    public void hydrateEagerInverseOneToOne(Object entity, EntityMetadata metadata) {
+        hydrateInverseOneToOne(entity, metadata, true);
+    }
+
+    /**
+     * Load inverse-side {@code @OneToOne} references regardless of fetch type.
+     * Used by the explicit fetch API ({@code em.initialize(...)}).
+     */
+    public void initializeInverseOneToOne(Object entity, EntityMetadata metadata) {
+        hydrateInverseOneToOne(entity, metadata, false);
+    }
+
+    private void hydrateInverseOneToOne(Object entity, EntityMetadata metadata, boolean eagerOnly) {
+        if (entity == null) {
+            return;
+        }
+        for (RelationshipMapping relationship : getRelationships(metadata)) {
+            if (relationship.relationshipType() != RelationshipMapping.RelationshipType.ONE_TO_ONE) {
+                continue;
+            }
+            if (relationship.isOwningSide()) {
+                continue;
+            }
+            if (eagerOnly && relationship.fetch() != FetchType.EAGER) {
+                continue;
+            }
+            if (metadata.isCompositeId()) {
+                throw new UnsupportedOperationException(
+                        "Inverse @OneToOne with a composite-id owner is not supported: "
+                                + metadata.getEntityClass().getName());
+            }
+            Object loaded = loadInverseOneToOne(entity, metadata, relationship);
+            if (loaded != null) {
+                setFieldValue(entity, relationship.field(), loaded);
+            }
+        }
+    }
+
+    private Object loadInverseOneToOne(Object entity, EntityMetadata metadata, RelationshipMapping relationship) {
+        EntityMetadata targetMeta = EntityMetadata.of(relationship.targetEntity());
+        Field ownerField = EntityMetadata.findField(relationship.targetEntity(), relationship.mappedBy());
+        if (ownerField == null || !ownerField.isAnnotationPresent(de.t14d3.spool.annotations.OneToOne.class)) {
+            throw new IllegalStateException("Inverse @OneToOne mappedBy field not found: "
+                    + relationship.targetEntity().getName() + "." + relationship.mappedBy());
+        }
+        String fkColumn = targetMeta.getColumnName(ownerField);
+        if (fkColumn == null || fkColumn.isBlank()) {
+            return null;
+        }
+        Object id = metadata.getIdValue(entity);
+        if (id == null) {
+            return null;
+        }
+
+        Query q = Query.select(entityManager.getDialect(), "*")
+                .from(targetMeta.getTableName())
+                .where(entityManager.getDialect().quoteIdentifier(fkColumn) + " = ?", id)
+                .build();
+        List<?> rows = entityManager.executeSelectQuery(q, relationship.targetEntity());
+        return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /**
      * Eagerly hydrate collection relationships (currently OneToMany) when configured with fetch=EAGER.
      * <p>
      * This runs a SELECT on the target table using the {@code mappedBy} foreign-key column and
@@ -463,19 +535,29 @@ public class RelationshipManager {
             if (relationship.fetch() != FetchType.EAGER) {
                 continue;
             }
-            if (relationship.mappedBy() == null || relationship.mappedBy().isBlank()) {
-                // EntityMetadata rejects blank mappedBy when the metadata is
-                // built; reaching this means the mapping was constructed
-                // outside the metadata path.
-                throw new IllegalStateException("OneToMany without mappedBy: "
-                        + metadata.getEntityClass().getName() + "." + relationship.field().getName());
-            }
 
             List<Object> children = loadOneToManyEntities(entity, metadata, relationship);
+            if (relationship.isOwningSide()) {
+                // Unidirectional FK-on-target: mutate through a tracking
+                // wrapper so flush() can write the FK delta.
+                LazyCollection wrapper = createLazyCollection(
+                        relationship.field(), mutationTracker(entity, relationship));
+                if (wrapper != null) {
+                    wrapper.replaceContents(children);
+                    setFieldValue(entity, relationship.field(), wrapper);
+                    continue;
+                }
+            }
             Collection<Object> ownerCollection = getOrCreateCollection(entity, relationship.field());
             ownerCollection.clear();
             ownerCollection.addAll(children);
         }
+    }
+
+    private Runnable mutationTracker(Object entity, RelationshipMapping relationship) {
+        return relationship.isOwningSide()
+                ? () -> entityManager.markOneToManyDirty(entity, relationship.field())
+                : null;
     }
 
     /**
@@ -495,14 +577,25 @@ public class RelationshipManager {
         Class<?> targetEntity = relationship.targetEntity();
         EntityMetadata targetMeta = EntityMetadata.of(targetEntity);
 
-        Field mappedByField = EntityMetadata.findField(targetEntity, relationship.mappedBy());
-        if (mappedByField == null) {
-            throw new IllegalStateException("OneToMany mappedBy field not found: " + targetEntity.getName() + "." + relationship.mappedBy());
-        }
-
-        String fkColumn = targetMeta.getColumnName(mappedByField);
-        if (fkColumn == null || fkColumn.isBlank()) {
-            throw new IllegalStateException("OneToMany mappedBy field is not column-mapped: " + targetEntity.getName() + "." + relationship.mappedBy());
+        Field mappedByField = null;
+        String fkColumn;
+        if (relationship.isOwningSide()) {
+            // Unidirectional @OneToMany: the FK column lives on the target
+            // table and is owned by this association (no field on the child).
+            fkColumn = relationship.joinColumn();
+            if (fkColumn == null || fkColumn.isBlank()) {
+                throw new IllegalStateException("Unidirectional OneToMany without a join column: "
+                        + metadata.getEntityClass().getName() + "." + relationship.field().getName());
+            }
+        } else {
+            mappedByField = EntityMetadata.findField(targetEntity, relationship.mappedBy());
+            if (mappedByField == null) {
+                throw new IllegalStateException("OneToMany mappedBy field not found: " + targetEntity.getName() + "." + relationship.mappedBy());
+            }
+            fkColumn = targetMeta.getColumnName(mappedByField);
+            if (fkColumn == null || fkColumn.isBlank()) {
+                throw new IllegalStateException("OneToMany mappedBy field is not column-mapped: " + targetEntity.getName() + "." + relationship.mappedBy());
+            }
         }
 
         Query q = Query.select(entityManager.getDialect(), "*")
@@ -513,11 +606,13 @@ public class RelationshipManager {
         @SuppressWarnings("unchecked")
         List<Object> children = (List<Object>) (List<?>) entityManager.executeSelectQuery(q, targetEntity);
 
-        for (Object child : children) {
-            if (child == null) {
-                continue;
+        if (mappedByField != null) {
+            for (Object child : children) {
+                if (child == null) {
+                    continue;
+                }
+                setFieldValue(child, mappedByField, entity);
             }
-            setFieldValue(child, mappedByField, entity);
         }
         return children;
     }
@@ -653,8 +748,9 @@ public class RelationshipManager {
     }
 
     private void installLazyOneToMany(Object entity, EntityMetadata metadata, RelationshipMapping relationship) {
-        if (relationship.mappedBy() == null || relationship.mappedBy().isBlank()) {
-            throw new IllegalStateException("OneToMany without mappedBy: "
+        if (relationship.isOwningSide()
+                && (relationship.joinColumn() == null || relationship.joinColumn().isBlank())) {
+            throw new IllegalStateException("Unidirectional OneToMany without a join column: "
                     + metadata.getEntityClass().getName() + "." + relationship.field().getName());
         }
         Object current = getFieldValue(entity, relationship.field());
@@ -662,7 +758,7 @@ public class RelationshipManager {
             return;
         }
 
-        LazyCollection wrapper = createLazyCollection(relationship.field());
+        LazyCollection wrapper = createLazyCollection(relationship.field(), mutationTracker(entity, relationship));
         if (wrapper == null) {
             return;
         }
@@ -692,7 +788,7 @@ public class RelationshipManager {
         if (current instanceof LazyCollection lazy) {
             wrapper = lazy;
         } else {
-            LazyCollection created = createLazyCollection(ownerField);
+            LazyCollection created = createLazyCollection(ownerField, null);
             if (created == null) {
                 return;
             }
@@ -728,16 +824,16 @@ public class RelationshipManager {
         }
     }
 
-    private static LazyCollection createLazyCollection(Field field) {
+    private static LazyCollection createLazyCollection(Field field, Runnable mutationTracker) {
         Class<?> declared = field.getType();
         if (List.class.isAssignableFrom(declared)) {
-            return new LazyOneToManyList();
+            return new LazyOneToManyList(mutationTracker);
         }
         if (Set.class.isAssignableFrom(declared)) {
-            return new LazyOneToManySet();
+            return new LazyOneToManySet(mutationTracker);
         }
         if (Collection.class.isAssignableFrom(declared)) {
-            return new LazyOneToManyCollection();
+            return new LazyOneToManyCollection(mutationTracker);
         }
         return null;
     }
@@ -949,6 +1045,22 @@ public class RelationshipManager {
          * Only called from the loader itself.
          */
         void replaceContents(Collection<Object> items);
+
+        /**
+         * True when mutations of this wrapper mark the owning association dirty.
+         */
+        default boolean hasMutationTracker() {
+            return false;
+        }
+    }
+
+    /**
+     * True when {@code value} is a lazy wrapper that records collection
+     * mutations. A replaced (plain) collection is untracked and must be diffed
+     * at flush time.
+     */
+    static boolean isMutationTracked(Object value) {
+        return value instanceof LazyCollection lazy && lazy.hasMutationTracker();
     }
 
     /**
@@ -1008,6 +1120,22 @@ public class RelationshipManager {
     private static final class LazyOneToManyList extends AbstractList<Object> implements LazyCollection {
         private final LazyState state = new LazyState();
         private final List<Object> delegate = new ArrayList<>();
+        private final Runnable mutationTracker;
+
+        private LazyOneToManyList(Runnable mutationTracker) {
+            this.mutationTracker = mutationTracker;
+        }
+
+        private void mutated() {
+            if (mutationTracker != null) {
+                mutationTracker.run();
+            }
+        }
+
+        @Override
+        public boolean hasMutationTracker() {
+            return mutationTracker != null;
+        }
 
         @Override
         public boolean isLoaded() {
@@ -1045,25 +1173,57 @@ public class RelationshipManager {
         @Override
         public Object set(int index, Object element) {
             ensureLoaded();
-            return delegate.set(index, element);
+            Object previous = delegate.set(index, element);
+            if (!Objects.equals(previous, element)) {
+                mutated();
+            }
+            return previous;
         }
 
         @Override
         public void add(int index, Object element) {
             ensureLoaded();
             delegate.add(index, element);
+            mutated();
         }
 
         @Override
         public Object remove(int index) {
             ensureLoaded();
-            return delegate.remove(index);
+            Object removed = delegate.remove(index);
+            mutated();
+            return removed;
+        }
+
+        @Override
+        public void clear() {
+            ensureLoaded();
+            if (!delegate.isEmpty()) {
+                delegate.clear();
+                mutated();
+            }
         }
     }
 
     private static final class LazyOneToManySet extends AbstractSet<Object> implements LazyCollection {
         private final LazyState state = new LazyState();
         private final Set<Object> delegate = new LinkedHashSet<>();
+        private final Runnable mutationTracker;
+
+        private LazyOneToManySet(Runnable mutationTracker) {
+            this.mutationTracker = mutationTracker;
+        }
+
+        private void mutated() {
+            if (mutationTracker != null) {
+                mutationTracker.run();
+            }
+        }
+
+        @Override
+        public boolean hasMutationTracker() {
+            return mutationTracker != null;
+        }
 
         @Override
         public boolean isLoaded() {
@@ -1089,7 +1249,24 @@ public class RelationshipManager {
         @Override
         public Iterator<Object> iterator() {
             ensureLoaded();
-            return delegate.iterator();
+            Iterator<Object> it = delegate.iterator();
+            return new Iterator<>() {
+                @Override
+                public boolean hasNext() {
+                    return it.hasNext();
+                }
+
+                @Override
+                public Object next() {
+                    return it.next();
+                }
+
+                @Override
+                public void remove() {
+                    it.remove();
+                    mutated();
+                }
+            };
         }
 
         @Override
@@ -1101,25 +1278,52 @@ public class RelationshipManager {
         @Override
         public boolean add(Object o) {
             ensureLoaded();
-            return delegate.add(o);
+            boolean added = delegate.add(o);
+            if (added) {
+                mutated();
+            }
+            return added;
         }
 
         @Override
         public boolean remove(Object o) {
             ensureLoaded();
-            return delegate.remove(o);
+            boolean removed = delegate.remove(o);
+            if (removed) {
+                mutated();
+            }
+            return removed;
         }
 
         @Override
         public void clear() {
             ensureLoaded();
-            delegate.clear();
+            if (!delegate.isEmpty()) {
+                delegate.clear();
+                mutated();
+            }
         }
     }
 
     private static final class LazyOneToManyCollection extends AbstractCollection<Object> implements LazyCollection {
         private final LazyState state = new LazyState();
         private final Collection<Object> delegate = new ArrayList<>();
+        private final Runnable mutationTracker;
+
+        private LazyOneToManyCollection(Runnable mutationTracker) {
+            this.mutationTracker = mutationTracker;
+        }
+
+        private void mutated() {
+            if (mutationTracker != null) {
+                mutationTracker.run();
+            }
+        }
+
+        @Override
+        public boolean hasMutationTracker() {
+            return mutationTracker != null;
+        }
 
         @Override
         public boolean isLoaded() {
@@ -1145,7 +1349,24 @@ public class RelationshipManager {
         @Override
         public Iterator<Object> iterator() {
             ensureLoaded();
-            return delegate.iterator();
+            Iterator<Object> it = delegate.iterator();
+            return new Iterator<>() {
+                @Override
+                public boolean hasNext() {
+                    return it.hasNext();
+                }
+
+                @Override
+                public Object next() {
+                    return it.next();
+                }
+
+                @Override
+                public void remove() {
+                    it.remove();
+                    mutated();
+                }
+            };
         }
 
         @Override
@@ -1157,19 +1378,30 @@ public class RelationshipManager {
         @Override
         public boolean add(Object o) {
             ensureLoaded();
-            return delegate.add(o);
+            boolean added = delegate.add(o);
+            if (added) {
+                mutated();
+            }
+            return added;
         }
 
         @Override
         public boolean remove(Object o) {
             ensureLoaded();
-            return delegate.remove(o);
+            boolean removed = delegate.remove(o);
+            if (removed) {
+                mutated();
+            }
+            return removed;
         }
 
         @Override
         public void clear() {
             ensureLoaded();
-            delegate.clear();
+            if (!delegate.isEmpty()) {
+                delegate.clear();
+                mutated();
+            }
         }
     }
 

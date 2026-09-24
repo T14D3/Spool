@@ -510,12 +510,12 @@ public class SchemaIntrospector {
                 nullable = false;
             }
 
-            // Handle @ManyToOne - foreign key columns
-            if (field.isAnnotationPresent(ManyToOne.class)) {
-                ManyToOne manyToOne = field.getAnnotation(ManyToOne.class);
-                // Foreign key type should match the referenced entity's ID type.
-                // Default nullability follows the relationship's optional flag.
-                nullable = manyToOne.optional();
+            // Handle owning single-reference associations - foreign key columns
+            if (EntityMetadata.isOwningToOne(field)) {
+                boolean optional = field.isAnnotationPresent(ManyToOne.class)
+                        ? field.getAnnotation(ManyToOne.class).optional()
+                        : field.getAnnotation(de.t14d3.spool.annotations.OneToOne.class).optional();
+                nullable = optional;
 
                 // Determine referenced table and column from field type
                 Class<?> targetEntityClass = field.getType();
@@ -707,6 +707,151 @@ public class SchemaIntrospector {
         }
 
         return joinTables;
+    }
+
+    /**
+     * Builds the complete expected schema for a set of registered entities:
+     * entity tables, ManyToMany join tables, and the FK columns that
+     * unidirectional {@code @OneToMany} associations place on their target
+     * table.
+     */
+    public Map<String, TableDefinition> buildExpectedSchema(Collection<Class<?>> entityClasses) {
+        Map<String, TableDefinition> expected = new LinkedHashMap<>();
+        for (Class<?> entityClass : orderByForeignKeyDependencies(entityClasses)) {
+            TableDefinition table = buildTableDefinitionFromEntity(entityClass);
+            expected.put(table.getName().toLowerCase(), table);
+        }
+        for (Class<?> entityClass : entityClasses) {
+            for (TableDefinition join : buildJoinTableDefinitionsFromEntity(entityClass)) {
+                expected.putIfAbsent(join.getName().toLowerCase(), join);
+            }
+        }
+        for (Class<?> entityClass : entityClasses) {
+            addUnidirectionalOneToManyForeignKeys(entityClass, expected);
+        }
+        return expected;
+    }
+
+    /**
+     * Orders entity classes so a table referenced by an inline foreign key is
+     * created first. Cycles (mutual or self references) keep their original
+     * relative order; databases that require deferred constraints for those
+     * are a known limitation.
+     */
+    private List<Class<?>> orderByForeignKeyDependencies(Collection<Class<?>> entityClasses) {
+        Map<Class<?>, Set<Class<?>>> dependencies = new LinkedHashMap<>();
+        for (Class<?> entityClass : entityClasses) {
+            Set<Class<?>> deps = new LinkedHashSet<>();
+            for (Field field : EntityMetadata.of(entityClass).getFields()) {
+                if (EntityMetadata.isOwningToOne(field)) {
+                    deps.add(field.getType());
+                }
+            }
+            dependencies.put(entityClass, deps);
+        }
+        // A unidirectional @OneToMany puts its FK on the target table, so the
+        // target depends on the declaring entity.
+        for (Class<?> entityClass : entityClasses) {
+            for (Field field : EntityMetadata.of(entityClass).getHierarchyFields()) {
+                de.t14d3.spool.annotations.OneToMany oneToMany =
+                        field.getAnnotation(de.t14d3.spool.annotations.OneToMany.class);
+                if (oneToMany == null || (oneToMany.mappedBy() != null && !oneToMany.mappedBy().isBlank())) {
+                    continue;
+                }
+                if (field.getAnnotation(JoinColumn.class) == null) {
+                    continue;
+                }
+                Set<Class<?>> targetDeps = dependencies.get(oneToMany.targetEntity());
+                if (targetDeps != null) {
+                    targetDeps.add(entityClass);
+                }
+            }
+        }
+
+        List<Class<?>> ordered = new ArrayList<>();
+        Set<Class<?>> remaining = new LinkedHashSet<>(entityClasses);
+        boolean progressed = true;
+        while (!remaining.isEmpty() && progressed) {
+            progressed = false;
+            for (Iterator<Class<?>> it = remaining.iterator(); it.hasNext(); ) {
+                Class<?> candidate = it.next();
+                Set<Class<?>> pending = new LinkedHashSet<>(dependencies.getOrDefault(candidate, Set.of()));
+                pending.retainAll(remaining);
+                pending.remove(candidate); // self-references are handled at the DB level
+                if (pending.isEmpty()) {
+                    ordered.add(candidate);
+                    it.remove();
+                    progressed = true;
+                }
+            }
+        }
+        ordered.addAll(remaining); // cycles: keep declaration order
+        return ordered;
+    }
+
+    /**
+     * Adds the FK column owned by a unidirectional {@code @OneToMany} to the
+     * table definition of its target entity.
+     */
+    private void addUnidirectionalOneToManyForeignKeys(Class<?> ownerClass, Map<String, TableDefinition> expected) {
+        EntityMetadata ownerMetadata = EntityMetadata.of(ownerClass);
+        for (Field field : ownerMetadata.getHierarchyFields()) {
+            de.t14d3.spool.annotations.OneToMany oneToMany =
+                    field.getAnnotation(de.t14d3.spool.annotations.OneToMany.class);
+            if (oneToMany == null || (oneToMany.mappedBy() != null && !oneToMany.mappedBy().isBlank())) {
+                continue;
+            }
+            JoinColumn joinColumn = field.getAnnotation(JoinColumn.class);
+            if (joinColumn == null || joinColumn.name().isBlank()) {
+                continue; // rejected at metadata build
+            }
+            if (ownerMetadata.isCompositeId()) {
+                throw new UnsupportedOperationException(
+                        "Unidirectional @OneToMany with a composite-id owner is not supported: "
+                                + ownerClass.getName() + "." + field.getName());
+            }
+
+            EntityMetadata targetMetadata = EntityMetadata.of(oneToMany.targetEntity());
+            TableDefinition targetTable = expected.get(targetMetadata.getTableName().toLowerCase());
+            if (targetTable == null) {
+                throw new IllegalArgumentException("Unidirectional @OneToMany " + ownerClass.getName() + "."
+                        + field.getName() + " targets " + targetMetadata.getEntityClass().getName()
+                        + ", which is not registered; register the target entity so its FK column can be created");
+            }
+            if (targetTable.hasColumn(joinColumn.name())) {
+                throw new IllegalArgumentException("Unidirectional @OneToMany " + ownerClass.getName() + "."
+                        + field.getName() + " needs FK column '" + joinColumn.name() + "' on table '"
+                        + targetTable.getName() + "', but that column is already mapped");
+            }
+            targetTable.addColumn(buildForeignKeyColumn(joinColumn.name(), ownerMetadata, true));
+        }
+    }
+
+    private ColumnDefinition buildForeignKeyColumn(String columnName, EntityMetadata ownerMetadata, boolean nullable) {
+        Class<?> idType = ownerMetadata.getIdField().getType();
+        String sqlType = TypeMapper.javaTypeToSqlType(idType);
+        Integer length = null;
+        if ((idType == String.class || idType == UUID.class)
+                && ownerMetadata.getIdField().isAnnotationPresent(Column.class)) {
+            length = ownerMetadata.getIdField().getAnnotation(Column.class).length();
+        }
+        if (dialect == Dialect.MYSQL && sqlType != null && sqlType.equalsIgnoreCase("VARCHAR")) {
+            if (idType == UUID.class && (length == null || length == 255)) {
+                length = 36;
+            } else if (length == null) {
+                length = defaultVarcharLengthFor(idType);
+            }
+        }
+        return new ColumnDefinition.Builder()
+                .name(columnName)
+                .sqlType(sqlType)
+                .nullable(nullable)
+                .primaryKey(false)
+                .autoIncrement(false)
+                .length(length)
+                .referencedTable(ownerMetadata.getTableName())
+                .referencedColumn(ownerMetadata.getIdColumnName())
+                .build();
     }
 
     // -----------------------

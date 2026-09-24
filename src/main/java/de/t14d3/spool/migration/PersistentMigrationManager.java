@@ -302,16 +302,7 @@ public class PersistentMigrationManager {
      * Get the schema diff between entities and database.
      */
     public SchemaDiff getSchemaDiff() throws SQLException {
-        Map<String, TableDefinition> expectedSchema = new LinkedHashMap<>();
-        for (Class<?> entityClass : entityClasses) {
-            TableDefinition table = introspector.buildTableDefinitionFromEntity(entityClass);
-            expectedSchema.put(table.getName().toLowerCase(), table);
-        }
-        for (Class<?> entityClass : entityClasses) {
-            for (TableDefinition join : introspector.buildJoinTableDefinitionsFromEntity(entityClass)) {
-                expectedSchema.putIfAbsent(join.getName().toLowerCase(), join);
-            }
-        }
+        Map<String, TableDefinition> expectedSchema = introspector.buildExpectedSchema(entityClasses);
 
         Map<String, TableDefinition> actualSchema = new LinkedHashMap<>();
         for (String tableName : expectedSchema.keySet()) {

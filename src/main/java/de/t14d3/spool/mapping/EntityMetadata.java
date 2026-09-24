@@ -142,8 +142,9 @@ public class EntityMetadata {
                 }
                 columnToField.put(columnName, field);
                 fieldToColumn.put(field, columnName);
-            } else if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
-                // Treat @ManyToOne fields as foreign key columns
+            } else if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)
+                    || isOwningToOne(field)) {
+                // Treat owning @ManyToOne/@OneToOne fields as foreign key columns
                 fields.add(field);
                 JoinColumn joinColumn = field.getAnnotation(JoinColumn.class);
                 // Convention: {fieldName}_id (overridable via @JoinColumn(name="..."))
@@ -242,11 +243,20 @@ public class EntityMetadata {
                         + field.getName() + "' must be a Collection, found " + field.getType().getName());
             }
             String mappedBy = oneToMany.mappedBy();
+            JoinColumn joinColumn = field.getAnnotation(JoinColumn.class);
             if (mappedBy == null || mappedBy.isBlank()) {
+                if (joinColumn == null || joinColumn.name().isBlank()) {
+                    throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToMany field '"
+                            + field.getName() + "' has a blank mappedBy and no @JoinColumn; unidirectional "
+                            + "@OneToMany needs @JoinColumn(name=\"...\") to name the FK column on "
+                            + oneToMany.targetEntity().getSimpleName());
+                }
+                return;
+            }
+            if (joinColumn != null) {
                 throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToMany field '"
-                        + field.getName() + "' has a blank mappedBy; unidirectional @OneToMany (join-column) "
-                        + "is not supported. Add the owning @ManyToOne field on "
-                        + oneToMany.targetEntity().getSimpleName() + " and set mappedBy to its name.");
+                        + field.getName() + "' declares both mappedBy='" + mappedBy + "' and @JoinColumn; "
+                        + "@JoinColumn is only used for unidirectional @OneToMany (blank mappedBy)");
             }
             Field inverse = findField(oneToMany.targetEntity(), mappedBy);
             if (inverse == null) {
@@ -294,10 +304,42 @@ public class EntityMetadata {
         }
 
         if (field.isAnnotationPresent(OneToOne.class)) {
-            throw new IllegalArgumentException("Entity " + declaring.getName() + " declares @OneToOne field '"
-                    + field.getName() + "'; Spool does not persist a foreign-key column for @OneToOne yet, so the "
-                    + "association would be silently lost. Model it as @ManyToOne until @OneToOne is supported.");
+            OneToOne oneToOne = field.getAnnotation(OneToOne.class);
+            if (oneToOne.mappedBy() != null && !oneToOne.mappedBy().isBlank()) {
+                Field owner = findField(field.getType(), oneToOne.mappedBy());
+                if (owner == null) {
+                    throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToOne field '"
+                            + field.getName() + "' declares mappedBy='" + oneToOne.mappedBy() + "' but "
+                            + field.getType().getName() + " has no such field");
+                }
+                if (!owner.isAnnotationPresent(OneToOne.class)) {
+                    throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToOne field '"
+                            + field.getName() + "' declares mappedBy='" + oneToOne.mappedBy() + "' but "
+                            + field.getType().getName() + "." + oneToOne.mappedBy()
+                            + " is not annotated with @OneToOne");
+                }
+                OneToOne ownerAnnotation = owner.getAnnotation(OneToOne.class);
+                if (ownerAnnotation.mappedBy() != null && !ownerAnnotation.mappedBy().isBlank()) {
+                    throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToOne field '"
+                            + field.getName() + "' declares mappedBy='" + oneToOne.mappedBy() + "' but "
+                            + field.getType().getName() + "." + oneToOne.mappedBy()
+                            + " is itself an inverse side (its mappedBy is set); mappedBy must point at the owning side");
+                }
+            }
         }
+    }
+
+    /**
+     * True for single-reference association fields that own a foreign-key
+     * column on this entity's table: {@code @ManyToOne} and owning-side
+     * {@code @OneToOne} (mappedBy blank).
+     */
+    public static boolean isOwningToOne(Field field) {
+        if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
+            return true;
+        }
+        OneToOne oneToOne = field.getAnnotation(OneToOne.class);
+        return oneToOne != null && (oneToOne.mappedBy() == null || oneToOne.mappedBy().isBlank());
     }
 
     /**
