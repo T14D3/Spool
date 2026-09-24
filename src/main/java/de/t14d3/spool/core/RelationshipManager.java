@@ -786,6 +786,94 @@ public class RelationshipManager {
     }
 
     /**
+     * Wave-based batch hydration of EAGER collection associations for a raw
+     * result set. Loaded collections are marked loaded, so the per-entity
+     * hydration pass skips them; children join the next wave so their own
+     * EAGER collections are batched too.
+     */
+    public void prefetchEagerCollections(List<?> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return;
+        }
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        Deque<Object> wave = new ArrayDeque<>();
+        for (Object row : rows) {
+            if (row != null) {
+                wave.add(row);
+            }
+        }
+
+        while (!wave.isEmpty()) {
+            Map<Class<?>, List<Object>> byClass = new LinkedHashMap<>();
+            while (!wave.isEmpty()) {
+                Object entity = wave.poll();
+                if (entity == null || !visited.add(entity)) {
+                    continue;
+                }
+                EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+                if (!metadata.getEntityId(entity).isComplete()) {
+                    continue;
+                }
+                byClass.computeIfAbsent(entity.getClass(), key -> new ArrayList<>()).add(entity);
+            }
+            if (byClass.isEmpty()) {
+                break;
+            }
+
+            List<Object> nextWave = new ArrayList<>();
+            for (Map.Entry<Class<?>, List<Object>> entry : byClass.entrySet()) {
+                EntityMetadata metadata = EntityMetadata.of(entry.getKey());
+                List<Object> parents = entry.getValue();
+                for (RelationshipMapping relationship : getRelationships(metadata)) {
+                    if (relationship.fetch() != FetchType.EAGER) {
+                        continue;
+                    }
+                    if (relationship.relationshipType() == RelationshipMapping.RelationshipType.ONE_TO_MANY) {
+                        if (metadata.isCompositeId()) {
+                            throw new UnsupportedOperationException(
+                                    "Eager collection hydration with a composite-id owner is not supported: "
+                                            + metadata.getEntityClass().getName());
+                        }
+                        Field mappedByField = relationship.isOwningSide()
+                                ? null
+                                : EntityMetadata.findField(relationship.targetEntity(), relationship.mappedBy());
+                        Map<Object, List<Object>> grouped = loadOneToManyBatch(parents, metadata, relationship);
+                        for (Object parent : parents) {
+                            List<Object> items = grouped.getOrDefault(metadata.getIdValue(parent), List.of());
+                            if (mappedByField != null) {
+                                for (Object child : items) {
+                                    setFieldValue(child, mappedByField, parent);
+                                }
+                            }
+                            applyLoadedCollection(parent, relationship, items);
+                            nextWave.addAll(items);
+                        }
+                    } else if (relationship.relationshipType() == RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+                        if (relationship.targetEntity() == Object.class) {
+                            continue;
+                        }
+                        Map<Object, List<Object>> grouped = loadManyToManyBatch(parents, metadata, relationship);
+                        Field ownerField = relationship.field();
+                        Field inverseField = resolveManyToManyInverseField(
+                                metadata.getEntityClass(), ownerField, relationship.targetEntity(), relationship.mappedBy());
+                        for (Object parent : parents) {
+                            List<Object> items = grouped.getOrDefault(metadata.getIdValue(parent), List.of());
+                            applyLoadedCollection(parent, relationship, items);
+                            if (inverseField != null) {
+                                for (Object related : items) {
+                                    syncManyToManyInverse(parent, related, inverseField, ownerField);
+                                }
+                            }
+                            nextWave.addAll(items);
+                        }
+                    }
+                }
+            }
+            wave.addAll(nextWave);
+        }
+    }
+
+    /**
      * Eagerly hydrate collection relationships (currently OneToMany) when configured with fetch=EAGER.
      * <p>
      * This runs a SELECT on the target table using the {@code mappedBy} foreign-key column and

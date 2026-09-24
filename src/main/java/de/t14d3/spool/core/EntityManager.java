@@ -53,6 +53,12 @@ public class EntityManager implements AutoCloseable {
     private final ThreadLocal<Set<Object>> cascadingRefreshStack;
     private final Set<ManyToManyDirtyKey> dirtyManyToMany;
     private final Set<OneToManyDirtyKey> dirtyOneToMany;
+    /**
+     * True while a wave-based batch prefetch of EAGER collections is running.
+     * Per-entity hydration is skipped inside the batch; the batch assigns the
+     * collections itself, and nested loads must not restart it.
+     */
+    private final ThreadLocal<Boolean> eagerCollectionBatch = ThreadLocal.withInitial(() -> Boolean.FALSE);
     private final Set<Object> detachedEntities;
     private CacheProvider cacheProvider;
     private CacheEventSink cacheEventSink;
@@ -1072,11 +1078,21 @@ public class EntityManager implements AutoCloseable {
         synchronized (connection) {
             List<T> rows = executor.findAll(entityClass);
             prefetchEagerSingleRefs(rows);
-            List<T> managed = new ArrayList<>(rows.size());
-            for (T row : rows) {
-                managed.add(manageLoadedEntity(row, metadata));
+            boolean ownsBatch = beginEagerCollectionBatch();
+            try {
+                if (ownsBatch) {
+                    relationshipManager.prefetchEagerCollections(rows);
+                }
+                List<T> managed = new ArrayList<>(rows.size());
+                for (T row : rows) {
+                    managed.add(manageLoadedEntity(row, metadata));
+                }
+                return managed;
+            } finally {
+                if (ownsBatch) {
+                    endEagerCollectionBatch();
+                }
             }
-            return managed;
         }
     }
 
@@ -1132,11 +1148,21 @@ public class EntityManager implements AutoCloseable {
             // Resolve eager single references in batches so loading N rows
             // does not issue N lookups per relation.
             prefetchEagerSingleRefs(rows);
-            List<T> results = new ArrayList<>(rows.size());
-            for (T row : rows) {
-                results.add(manageLoadedEntity(row, metadata));
+            boolean ownsBatch = beginEagerCollectionBatch();
+            try {
+                if (ownsBatch) {
+                    relationshipManager.prefetchEagerCollections(rows);
+                }
+                List<T> results = new ArrayList<>(rows.size());
+                for (T row : rows) {
+                    results.add(manageLoadedEntity(row, metadata));
+                }
+                return results;
+            } finally {
+                if (ownsBatch) {
+                    endEagerCollectionBatch();
+                }
             }
-            return results;
         }
     }
 
@@ -1765,6 +1791,23 @@ public class EntityManager implements AutoCloseable {
         return entity;
     }
 
+    /**
+     * Start a wave-based batch prefetch of EAGER collections. Returns false
+     * when a batch is already active (nested load), so only the outermost call
+     * runs the batch and clears the flag.
+     */
+    private boolean beginEagerCollectionBatch() {
+        if (Boolean.TRUE.equals(eagerCollectionBatch.get())) {
+            return false;
+        }
+        eagerCollectionBatch.set(Boolean.TRUE);
+        return true;
+    }
+
+    private void endEagerCollectionBatch() {
+        eagerCollectionBatch.set(Boolean.FALSE);
+    }
+
     private <T> T manageLoadedEntity(T entity, EntityMetadata metadata) {
         if (entity == null) {
             return null;
@@ -1786,8 +1829,10 @@ public class EntityManager implements AutoCloseable {
         identityMap.put(key, entity);
         relationshipManager.prepareRelationships(entity, metadata);
         relationshipManager.hydrateEagerSingleRefs(entity, metadata);
-        relationshipManager.hydrateEagerCollections(entity, metadata);
-        relationshipManager.hydrateEagerManyToMany(entity, metadata);
+        if (!Boolean.TRUE.equals(eagerCollectionBatch.get())) {
+            relationshipManager.hydrateEagerCollections(entity, metadata);
+            relationshipManager.hydrateEagerManyToMany(entity, metadata);
+        }
         relationshipManager.hydrateEagerInverseOneToOne(entity, metadata);
         relationshipManager.installLazyCollections(entity, metadata);
         // Fire @PreLoad before the dirty-check baseline is captured so state
