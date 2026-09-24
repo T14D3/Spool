@@ -8,12 +8,15 @@ import de.t14d3.spool.cache.EntitySnapshot;
 import de.t14d3.spool.cache.NoOpCacheEventSink;
 import de.t14d3.spool.cache.NoOpCacheProvider;
 import de.t14d3.spool.annotations.JoinTable;
+import de.t14d3.spool.mapping.EntityCallbacks;
+import de.t14d3.spool.mapping.EntityId;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.migration.MigrationManager;
 import de.t14d3.spool.migration.PersistentMigrationManager;
 import de.t14d3.spool.migration.MigrationFile;
 import de.t14d3.spool.migration.SchemaIntrospector;
 import de.t14d3.spool.query.Dialect;
+import de.t14d3.spool.query.LockMode;
 import de.t14d3.spool.query.Query;
 
 import java.io.IOException;
@@ -36,7 +39,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * Manages entity lifecycle and persistence operations.
  * Similar to Doctrine's EntityManager.
  */
-public class EntityManager {
+public class EntityManager implements AutoCloseable {
     private final SqlExecutor executor;
     private final Connection connection;
     private final Dialect dialect;
@@ -88,6 +91,20 @@ public class EntityManager {
     public static EntityManager create(String jdbcUrl) {
         try {
             Connection connection = DriverManager.getConnection(jdbcUrl);
+            Dialect dialect = Dialect.detectFromUrl(jdbcUrl);
+            return new EntityManager(connection, dialect);
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to create EntityManager connection", e);
+        }
+    }
+
+    /**
+     * Create a new EntityManager with the given database connection URL and
+     * credentials.
+     */
+    public static EntityManager create(String jdbcUrl, String user, String password) {
+        try {
+            Connection connection = DriverManager.getConnection(jdbcUrl, user, password);
             Dialect dialect = Dialect.detectFromUrl(jdbcUrl);
             return new EntityManager(connection, dialect);
         } catch (SQLException e) {
@@ -222,7 +239,14 @@ public class EntityManager {
             flush();
             commit();
         } catch (Exception e) {
-            rollback();
+            // A failed flush may have rolled the transaction back already.
+            if (isTransactionActive()) {
+                try {
+                    rollback();
+                } catch (RuntimeException rollbackFailure) {
+                    e.addSuppressed(rollbackFailure);
+                }
+            }
             throw new RuntimeException("Transaction failed and was rolled back", e);
         }
     }
@@ -245,7 +269,13 @@ public class EntityManager {
             commit();
             return result;
         } catch (Exception e) {
-            rollback();
+            if (isTransactionActive()) {
+                try {
+                    rollback();
+                } catch (RuntimeException rollbackFailure) {
+                    e.addSuppressed(rollbackFailure);
+                }
+            }
             throw new RuntimeException("Transaction failed and was rolled back", e);
         }
     }
@@ -264,8 +294,8 @@ public class EntityManager {
 
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
         relationshipManager.prepareRelationships(entity, metadata);
-        Object id = metadata.getIdValue(entity);
-        if (id != null && identityMap.containsKey(new EntityKey(entity.getClass(), id))) {
+        EntityId id = metadata.getEntityId(entity);
+        if (id.isComplete() && identityMap.containsKey(new EntityKey(entity.getClass(), id))) {
             pendingUpdates.add(entity);
         } else {
             pendingInserts.add(entity);
@@ -283,8 +313,8 @@ public class EntityManager {
 
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
         relationshipManager.prepareRelationships(entity, metadata);
-        Object id = metadata.getIdValue(entity);
-        if (id != null && identityMap.containsKey(new EntityKey(entity.getClass(), id))) {
+        EntityId id = metadata.getEntityId(entity);
+        if (id.isComplete() && identityMap.containsKey(new EntityKey(entity.getClass(), id))) {
             pendingUpdates.add(entity);
         } else {
             pendingInserts.add(entity);
@@ -305,8 +335,8 @@ public class EntityManager {
         pendingDeletes.add(entity);
 
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-        Object id = metadata.getIdValue(entity);
-        if (id != null) {
+        EntityId id = metadata.getEntityId(entity);
+        if (id.isComplete()) {
             EntityKey key = new EntityKey(entity.getClass(), id);
             identityMap.remove(key);
             originalValues.remove(key);
@@ -351,8 +381,8 @@ public class EntityManager {
         } catch (Exception ignored) {
             return;
         }
-        Object id = metadata.getIdValue(entity);
-        if (id != null) {
+        EntityId id = metadata.getEntityId(entity);
+        if (id.isComplete()) {
             EntityKey key = new EntityKey(entity.getClass(), id);
             identityMap.remove(key);
             originalValues.remove(key);
@@ -402,7 +432,11 @@ public class EntityManager {
         if (id == null) {
             return false;
         }
-        return identityMap.containsKey(new EntityKey(entityClass, id));
+        EntityId entityId = EntityMetadata.of(entityClass).getEntityIdFrom(id);
+        if (!entityId.isComplete()) {
+            return false;
+        }
+        return identityMap.containsKey(new EntityKey(entityClass, entityId));
     }
 
     /**
@@ -417,17 +451,21 @@ public class EntityManager {
             return null;
         }
 
+        EntityMetadata metadata = EntityMetadata.of(entityClass);
+        EntityId entityId = metadata.getEntityIdFrom(id);
+        if (!entityId.isComplete()) {
+            return null;
+        }
+
         // Check identity map first (ConcurrentHashMap - lock-free)
-        EntityKey key = new EntityKey(entityClass, id);
+        EntityKey key = new EntityKey(entityClass, entityId);
         T cached = (T) identityMap.get(key);
         if (cached != null) {
             return cached;
         }
 
-        EntityMetadata metadata = EntityMetadata.of(entityClass);
-
         // Check L2 cache (entity-by-id)
-        Optional<EntitySnapshot> snapshot = cacheProvider.get(CacheKey.of(entityClass, id));
+        Optional<EntitySnapshot> snapshot = cacheProvider.get(CacheKey.of(entityClass, entityId));
         if (snapshot.isPresent()) {
             T entity = hydrateFromSnapshot(entityClass, metadata, snapshot.get());
             return manageLoadedEntity(entity, metadata);
@@ -435,7 +473,7 @@ public class EntityManager {
 
         // Load from database - synchronize on the shared JDBC connection
         synchronized (connection) {
-            T entity = executor.findById(entityClass, id);
+            T entity = executor.findById(entityClass, entityId);
             if (entity == null) {
                 return null;
             }
@@ -446,18 +484,54 @@ public class EntityManager {
     /**
      * Flush all pending changes to the database.
      * <p>
+     * Doctrine-style semantics: every managed entity whose mapped columns
+     * differ from the snapshot taken when it was loaded is written, even if
+     * {@link #persist(Object)} was never called for it. Entities queued via
+     * {@code persist} are inserted or updated, entities queued via
+     * {@code remove} are deleted, and cascade rules are applied.
+     * <p>
+     * If no transaction is active, the flush runs inside an implicit
+     * transaction so a failure halfway through cannot leave a partially
+     * written flush behind; the transaction is committed on success and
+     * rolled back on failure.
+     * <p>
      * Thread-safe: drains the concurrent operation queues, then processes
      * all changes under the shared JDBC connection lock. The connection
      * lock is held only during actual SQL I/O, not during entity mutation
      * tracking (which is lock-free via ConcurrentLinkedQueue).
-     * <p>
-     * If a transaction is active and an exception occurs, the transaction
-     * is automatically rolled back.
      *
      * @throws RuntimeException if flush fails
      */
-    @SuppressWarnings({"unchecked", "rawtypes"})
     public void flush() {
+        boolean implicitTransaction = false;
+        synchronized (connection) {
+            if (!transactionActive) {
+                beginTransaction();
+                implicitTransaction = true;
+            }
+        }
+
+        try {
+            flushWork();
+            if (implicitTransaction) {
+                commit();
+            }
+        } catch (RuntimeException e) {
+            synchronized (connection) {
+                if (transactionActive) {
+                    try {
+                        rollback();
+                    } catch (RuntimeException suppressed) {
+                        e.addSuppressed(suppressed);
+                    }
+                }
+            }
+            throw e;
+        }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void flushWork() {
         // 1. Atomically drain all pending operation queues (lock-free).
         // 2. Drain queues and process under the shared connection lock.
         List<Object> inserts = drainList(pendingInserts);
@@ -477,8 +551,8 @@ public class EntityManager {
                 Set<Object> deleteSet = Collections.newSetFromMap(new IdentityHashMap<>());
                 for (Object e : deletes) {
                     EntityMetadata meta = EntityMetadata.of(e.getClass());
-                    Object id = meta.getIdValue(e);
-                    if (id != null) {
+                    EntityId id = meta.getEntityId(e);
+                    if (id.isComplete()) {
                         EntityKey key = new EntityKey(e.getClass(), id);
                         Object managed = identityMap.get(key);
                         deleteSet.add(managed != null ? managed : e);
@@ -492,12 +566,15 @@ public class EntityManager {
                 // Auto-increment entities with id=0 or null are NEW, not detached.
                 inserts.removeIf(e -> {
                     EntityMetadata meta = EntityMetadata.of(e.getClass());
-                    Object id = meta.getIdValue(e);
-                    if (id == null) return false;
+                    EntityId id = meta.getEntityId(e);
+                    if (!id.isComplete()) return false;
                     // Entities with an explicit ID that was never managed are new - keep them.
                     // Only filter if the entity was explicitly detached via detach().
-                    if (meta.isAutoIncrement() && id instanceof Number n && n.longValue() == 0L) {
-                        return false;
+                    if (meta.isAutoIncrement()) {
+                        Object idValue = id.singleValue();
+                        if (idValue instanceof Number n && n.longValue() == 0L) {
+                            return false;
+                        }
                     }
                     return detachedEntities.contains(e);
                 });
@@ -523,9 +600,11 @@ public class EntityManager {
                     // Unlink ManyToMany in-memory collections as part of the flush,
                     // so rollback keeps the in-memory state consistent with the DB.
                     relationshipManager.unlinkManyToMany(entity, meta);
+                    EntityCallbacks.of(entity.getClass()).invoke(EntityCallbacks.Phase.PRE_REMOVE, entity);
                     executor.delete(entity, meta);
-                    Object id = meta.getIdValue(entity);
-                    if (id != null) {
+                    EntityCallbacks.of(entity.getClass()).invoke(EntityCallbacks.Phase.POST_REMOVE, entity);
+                    EntityId id = meta.getEntityId(entity);
+                    if (id.isComplete()) {
                         recordCacheEvent(cacheEvents, CacheKey.of(entity.getClass(), id), CacheEvent.Operation.DELETE);
                     }
                 }
@@ -553,20 +632,46 @@ public class EntityManager {
                 Set<Object> updateSet = Collections.newSetFromMap(new IdentityHashMap<>());
                 for (Object e : updates) {
                     EntityMetadata meta = EntityMetadata.of(e.getClass());
-                    Object id = meta.getIdValue(e);
-                    if (id == null) continue;
+                    EntityId id = meta.getEntityId(e);
+                    if (!id.isComplete()) continue;
                     EntityKey key = new EntityKey(e.getClass(), id);
                     Object managed = identityMap.get(key);
                     if (managed != null) updateSet.add(managed);
                 }
 
+                // ── Auto dirty checking ─────────────────────────────────
+                // Any managed entity whose mapped columns differ from its
+                // load-time snapshot is written even without persist(),
+                // matching what developers expect from a Doctrine-style
+                // flush. Collections are excluded from getFields(), so this
+                // never triggers a lazy load.
+                for (Map.Entry<EntityKey, Object> entry : identityMapSnapshot.entrySet()) {
+                    Object candidate = entry.getValue();
+                    if (candidate == null
+                            || deleteSet.contains(candidate)
+                            || detachedEntities.contains(candidate)) {
+                        continue;
+                    }
+                    EntityMetadata meta = EntityMetadata.of(candidate.getClass());
+                    Map<Field, Object> snapshot = originalValuesSnapshot.get(entry.getKey());
+                    if (SqlExecutor.hasChanges(candidate, meta, snapshot)) {
+                        updateSet.add(candidate);
+                    }
+                }
+
                 for (Object entity : updateSet) {
                     EntityMetadata meta = EntityMetadata.of(entity.getClass());
-                    Object id = meta.getIdValue(entity);
+                    EntityId id = meta.getEntityId(entity);
                     Map<Field, Object> snapshot = originalValues.get(new EntityKey(entity.getClass(), id));
-                    executor.update(entity, meta, snapshot);
-                    if (id != null) {
-                        originalValues.put(new EntityKey(entity.getClass(), id), takeSnapshotValues(entity, meta));
+                    if (SqlExecutor.hasChanges(entity, meta, snapshot)) {
+                        EntityCallbacks callbacks = EntityCallbacks.of(entity.getClass());
+                        callbacks.invoke(EntityCallbacks.Phase.PRE_UPDATE, entity);
+                        executor.update(entity, meta, snapshot);
+                        callbacks.invoke(EntityCallbacks.Phase.POST_UPDATE, entity);
+                    }
+                    if (id.isComplete()) {
+                        EntityKey entityKey = new EntityKey(entity.getClass(), id);
+                        originalValues.put(entityKey, takeSnapshotValues(entity, meta));
                         recordCacheEvent(cacheEvents, CacheKey.of(entity.getClass(), id), CacheEvent.Operation.UPSERT);
                     }
                 }
@@ -672,8 +777,8 @@ public class EntityManager {
         detachStack.add(entity);
         try {
             EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-            Object id = metadata.getIdValue(entity);
-            if (id != null) {
+            EntityId id = metadata.getEntityId(entity);
+            if (id.isComplete()) {
                 EntityKey key = new EntityKey(entity.getClass(), id);
                 identityMap.remove(key);
                 originalValues.remove(key);
@@ -711,8 +816,8 @@ public class EntityManager {
         refreshStack.add(entity);
         try {
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-        Object id = metadata.getIdValue(entity);
-        if (id == null) {
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
             throw new IllegalStateException("Cannot refresh transient entity");
         }
 
@@ -741,7 +846,7 @@ public class EntityManager {
         // Update snapshot after refresh
         Map<Field, Object> snapshot = new HashMap<>();
         for (Field field : metadata.getFields()) {
-            if (field.equals(metadata.getIdField())) continue;
+            if (metadata.isIdField(field)) continue;
             snapshot.put(field, metadata.getFieldValue(entity, field));
         }
         originalValues.put(key, snapshot);
@@ -758,6 +863,66 @@ public class EntityManager {
     }
 
     /**
+     * Acquire a database row lock for a managed or detached entity.
+     * <p>
+     * Issues a {@code SELECT ... FOR UPDATE}/{@code FOR SHARE} on the entity's
+     * primary key and therefore requires an active transaction. The entity
+     * itself is not refreshed; the lock is held until the transaction commits
+     * or rolls back.
+     *
+     * @param entity the entity to lock
+     * @param mode   the lock mode
+     * @throws IllegalStateException       if the entity is transient or no transaction is active
+     * @throws UnsupportedOperationException if the dialect has no locking clause
+     */
+    public void lock(Object entity, LockMode mode) {
+        if (entity == null) {
+            throw new IllegalArgumentException("Cannot lock null entity");
+        }
+        if (mode == null) {
+            throw new IllegalArgumentException("Lock mode must not be null");
+        }
+
+        EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
+            throw new IllegalStateException("Cannot lock transient entity");
+        }
+
+        synchronized (connection) {
+            if (!transactionActive) {
+                throw new IllegalStateException("lock() requires an active transaction");
+            }
+
+            String clause = dialect.lockClause(mode);
+            if (clause == null) {
+                throw new UnsupportedOperationException(
+                        "Dialect " + dialect + " does not support locking mode " + mode);
+            }
+
+            List<Object> lockParams = new ArrayList<>();
+            String lockCondition = SqlExecutor.idWhere(dialect, metadata, id, lockParams);
+            Query q = Query.select(dialect, metadata.getIdColumnNames().toArray(new String[0]))
+                    .from(metadata.getTableName())
+                    .where(lockCondition, lockParams.toArray())
+                    .lock(clause)
+                    .build();
+
+            try (PreparedStatement stmt = connection.prepareStatement(q.getSql())) {
+                SqlExecutor.setParameters(stmt, q.getParameters());
+                try (ResultSet rs = stmt.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new IllegalStateException(
+                                "Entity no longer exists: " + entity.getClass().getName() + "#" + id);
+                    }
+                }
+            } catch (SQLException e) {
+                throw new RuntimeException("Failed to lock " + entity.getClass().getName() + "#" + id, e);
+            }
+        }
+    }
+
+    /**
      * Merge the state of a detached entity into the persistence context.
      * Returns the managed entity instance.
      */
@@ -768,9 +933,9 @@ public class EntityManager {
 
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
         relationshipManager.prepareRelationships(entity, metadata);
-        Object id = metadata.getIdValue(entity);
+        EntityId id = metadata.getEntityId(entity);
 
-        if (id == null) {
+        if (!id.isComplete()) {
             // Transient entity - treat as persist
             persist(entity);
             return entity;
@@ -800,7 +965,7 @@ public class EntityManager {
 
         // Copy state from the detached entity to the managed one
         for (Field field : metadata.getFields()) {
-            if (field != metadata.getIdField()) {
+            if (!metadata.isIdField(field)) {
                 Object value = metadata.getFieldValue(entity, field);
                 metadata.setFieldValue(managedEntity, field, value);
             }
@@ -824,7 +989,7 @@ public class EntityManager {
         // Take snapshot after merge
         Map<Field, Object> snapshot = new HashMap<>();
         for (Field field : metadata.getFields()) {
-            if (field.equals(metadata.getIdField())) continue;
+            if (metadata.isIdField(field)) continue;
             snapshot.put(field, metadata.getFieldValue(managedEntity, field));
         }
         originalValues.put(key, snapshot);
@@ -875,6 +1040,7 @@ public class EntityManager {
         EntityMetadata metadata = EntityMetadata.of(entityClass);
         synchronized (connection) {
             List<T> rows = executor.findAll(entityClass);
+            prefetchEagerSingleRefs(rows);
             List<T> managed = new ArrayList<>(rows.size());
             for (T row : rows) {
                 managed.add(manageLoadedEntity(row, metadata));
@@ -887,21 +1053,59 @@ public class EntityManager {
      * Execute a SELECT query and attach results to this EntityManager.
      */
     public <T> List<T> executeSelectQuery(Query query, Class<T> entityClass) {
+        return executeSelectQuery(query.getSql(), query.getParameters(), entityClass);
+    }
+
+    /**
+     * Execute a scalar COUNT-style query and return its single numeric result.
+     */
+    public long executeCountQuery(String sql, List<Object> parameters) {
+        synchronized (connection) {
+            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                SqlExecutor.setParameters(stmt, parameters);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    return rs.next() ? rs.getLong(1) : 0L;
+                }
+            } catch (SQLException e) {
+                throw new RuntimeException("Failed to execute count query: " + sql + " params=" + parameters, e);
+            }
+        }
+    }
+
+    /**
+     * Count all rows of an entity type without loading them.
+     */
+    public long count(Class<?> entityClass) {
+        return executor.count(EntityMetadata.of(entityClass).getTableName());
+    }
+
+    /**
+     * Execute a SELECT statement with explicit parameters and attach results
+     * to this EntityManager.
+     */
+    public <T> List<T> executeSelectQuery(String sql, List<Object> parameters, Class<T> entityClass) {
         EntityMetadata metadata = EntityMetadata.of(entityClass);
         synchronized (connection) {
-            List<T> results = new ArrayList<>();
-            try (PreparedStatement stmt = connection.prepareStatement(query.getSql())) {
-                SqlExecutor.setParameters(stmt, query.getParameters());
+            List<T> rows = new ArrayList<>();
+            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                SqlExecutor.setParameters(stmt, parameters);
                 try (ResultSet rs = stmt.executeQuery()) {
                     while (rs.next()) {
-                        T entity = SqlExecutor.mapResultSetToEntity(rs, metadata);
-                        results.add(manageLoadedEntity(entity, metadata));
+                        rows.add(SqlExecutor.mapResultSetToEntity(rs, metadata));
                     }
                 }
-                return results;
             } catch (SQLException e) {
-                throw new RuntimeException("Failed to execute query: " + query.getSql() + " params=" + query.getParameters(), e);
+                throw new RuntimeException("Failed to execute query: " + sql + " params=" + parameters, e);
             }
+
+            // Resolve eager single references in batches so loading N rows
+            // does not issue N lookups per relation.
+            prefetchEagerSingleRefs(rows);
+            List<T> results = new ArrayList<>(rows.size());
+            for (T row : rows) {
+                results.add(manageLoadedEntity(row, metadata));
+            }
+            return results;
         }
     }
 
@@ -932,8 +1136,8 @@ public class EntityManager {
         }
 
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-        Object id = metadata.getIdValue(entity);
-        if (id == null) {
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
             return;
         }
         EntityKey key = new EntityKey(entity.getClass(), id);
@@ -949,18 +1153,18 @@ public class EntityManager {
             return;
         }
         EntityMetadata metadata = EntityMetadata.of(entity.getClass());
-        Object id = metadata.getIdValue(entity);
-        if (id == null) {
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
             return;
         }
         dirtyManyToMany.add(new ManyToManyDirtyKey(entity.getClass(), id, field.getName()));
     }
 
-    private boolean isManyToManyDirty(Class<?> entityClass, Object id, Field field) {
+    private boolean isManyToManyDirty(Class<?> entityClass, EntityId id, Field field) {
         return dirtyManyToMany.contains(new ManyToManyDirtyKey(entityClass, id, field.getName()));
     }
 
-    private void clearManyToManyDirty(Class<?> entityClass, Object id, Field field) {
+    private void clearManyToManyDirty(Class<?> entityClass, EntityId id, Field field) {
         dirtyManyToMany.remove(new ManyToManyDirtyKey(entityClass, id, field.getName()));
     }
 
@@ -969,8 +1173,8 @@ public class EntityManager {
      */
     @SuppressWarnings("BooleanMethodIsAlwaysInverted")
     private boolean isInDatabase(Object entity, EntityMetadata metadata) {
-        Object id = metadata.getIdValue(entity);
-        if (id == null) {
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
             return false;
         }
 
@@ -1015,6 +1219,11 @@ public class EntityManager {
     @SuppressWarnings("UnusedReturnValue")
     public EntityManager registerEntities(Class<?>... entityClasses) {
         getMigrationManager().registerEntities(entityClasses);
+        // Build metadata eagerly so entity names are resolvable by HQL before
+        // the first schema/CRUD operation touches the class.
+        for (Class<?> entityClass : entityClasses) {
+            EntityMetadata.of(entityClass);
+        }
         return this;
     }
 
@@ -1206,12 +1415,111 @@ public class EntityManager {
         return dialect;
     }
 
+    /**
+     * Load the targets of eager {@code @ManyToOne}/{@code @OneToOne}
+     * relations referenced by {@code roots} in one query per target class per
+     * level, instead of one query per row. Loaded targets are managed and
+     * their own eager references are prefetched recursively; the subsequent
+     * per-entity hydration then finds them in the identity map.
+     */
+    private void prefetchEagerSingleRefs(List<?> roots) {
+        if (roots == null || roots.isEmpty()) {
+            return;
+        }
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        Deque<Object> queue = new ArrayDeque<>(roots);
+
+        while (!queue.isEmpty()) {
+            Map<Class<?>, Set<Object>> missingByClass = new LinkedHashMap<>();
+
+            while (!queue.isEmpty()) {
+                Object entity = queue.poll();
+                if (entity == null || !visited.add(entity)) {
+                    continue;
+                }
+                EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+                for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+                    if (relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_ONE
+                            && relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_ONE) {
+                        continue;
+                    }
+                    if (relationship.fetch() != de.t14d3.spool.annotations.FetchType.EAGER) {
+                        continue;
+                    }
+                    Object related = metadata.getFieldValue(entity, relationship.field());
+                    if (related == null) {
+                        continue;
+                    }
+                    EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
+                    if (relatedMeta.isCompositeId()) {
+                        continue; // unsupported relationship target
+                    }
+                    EntityId relatedId = relatedMeta.getEntityId(related);
+                    if (!relatedId.isComplete()) {
+                        continue;
+                    }
+                    if (identityMap.containsKey(new EntityKey(related.getClass(), relatedId))) {
+                        continue;
+                    }
+                    missingByClass
+                            .computeIfAbsent(related.getClass(), key -> new LinkedHashSet<>())
+                            .add(relatedId.singleValue());
+                }
+            }
+
+            List<Object> loadedThisWave = new ArrayList<>();
+            for (Map.Entry<Class<?>, Set<Object>> entry : missingByClass.entrySet()) {
+                @SuppressWarnings("unchecked")
+                Class<Object> targetClass = (Class<Object>) entry.getKey();
+                List<Object> ids = new ArrayList<>(entry.getValue());
+                // Keep IN clauses small enough for databases with parameter limits.
+                for (int i = 0; i < ids.size(); i += 500) {
+                    List<Object> chunk = ids.subList(i, Math.min(i + 500, ids.size()));
+                    List<Object> rows = executor.findByIds(targetClass, chunk);
+                    for (Object row : rows) {
+                        EntityMetadata metadata = EntityMetadata.of(row.getClass());
+                        Object managed = managePrefetched(row, metadata);
+                        if (managed == row) {
+                            loadedThisWave.add(row);
+                        }
+                    }
+                }
+            }
+            queue.addAll(loadedThisWave);
+        }
+    }
+
+    /**
+     * Attach a prefetched entity to the identity map without hydrating its
+     * eager relations; those are resolved by the prefetch queue itself.
+     */
+    @SuppressWarnings("unchecked")
+    private <T> T managePrefetched(T entity, EntityMetadata metadata) {
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
+            return entity;
+        }
+        EntityKey key = new EntityKey(entity.getClass(), id);
+        T existing = (T) identityMap.get(key);
+        if (existing != null) {
+            return existing;
+        }
+
+        identityMap.put(key, entity);
+        relationshipManager.prepareRelationships(entity, metadata);
+        relationshipManager.installLazyCollections(entity, metadata);
+        EntityCallbacks.of(entity.getClass()).invoke(EntityCallbacks.Phase.PRE_LOAD, entity);
+        originalValues.put(key, takeSnapshotValues(entity, metadata));
+        cacheProvider.put(CacheKey.of(entity.getClass(), id), takeEntitySnapshot(entity, metadata), cacheTtl);
+        return entity;
+    }
+
     private <T> T manageLoadedEntity(T entity, EntityMetadata metadata) {
         if (entity == null) {
             return null;
         }
-        Object id = metadata.getIdValue(entity);
-        if (id == null) {
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
             return entity;
         }
 
@@ -1227,6 +1535,10 @@ public class EntityManager {
         relationshipManager.hydrateEagerSingleRefs(entity, metadata);
         relationshipManager.hydrateEagerCollections(entity, metadata);
         relationshipManager.hydrateEagerManyToMany(entity, metadata);
+        relationshipManager.installLazyCollections(entity, metadata);
+        // Fire @PreLoad before the dirty-check baseline is captured so state
+        // set by the callback is treated as loaded state, not an update.
+        EntityCallbacks.of(entity.getClass()).invoke(EntityCallbacks.Phase.PRE_LOAD, entity);
         originalValues.put(key, takeSnapshotValues(entity, metadata));
         cacheProvider.put(CacheKey.of(entity.getClass(), id), takeEntitySnapshot(entity, metadata), cacheTtl);
         return entity;
@@ -1256,8 +1568,8 @@ public class EntityManager {
     }
 
     private static EntitySnapshot takeEntitySnapshot(Object entity, EntityMetadata metadata) {
-        Object idObj = metadata.getIdValue(entity);
-        if (idObj == null) {
+        EntityId idObj = metadata.getEntityId(entity);
+        if (!idObj.isComplete()) {
             throw new IllegalStateException("Cannot snapshot entity without id: " + entity.getClass().getName());
         }
 
@@ -1283,7 +1595,7 @@ public class EntityManager {
     private static Map<Field, Object> takeSnapshotValues(Object entity, EntityMetadata metadata) {
         Map<Field, Object> snapshot = new HashMap<>();
         for (Field field : metadata.getFields()) {
-            if (field.equals(metadata.getIdField())) continue;
+            if (metadata.isIdField(field)) continue;
             if (field.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)) {
                 Object related = metadata.getFieldValue(entity, field);
                 if (related == null) {
@@ -1324,6 +1636,11 @@ public class EntityManager {
                     metadata.setFieldValue(entity, field, null);
                 } else {
                     EntityMetadata relatedMeta = EntityMetadata.of(field.getType());
+                    if (relatedMeta.isCompositeId()) {
+                        throw new UnsupportedOperationException(
+                                "@ManyToOne target with a composite id is not supported: "
+                                        + field.getType().getName());
+                    }
                     Object related = relatedMeta.newInstance();
                     Object convertedId = de.t14d3.spool.mapping.TypeMapper.convertToJavaType(v, relatedMeta.getIdField().getType());
                     relatedMeta.setIdValue(related, convertedId);
@@ -1354,7 +1671,7 @@ public class EntityManager {
         }
     }
 
-    private record ManyToManyDirtyKey(Class<?> entityClass, Object id, String fieldName) {}
+    private record ManyToManyDirtyKey(Class<?> entityClass, EntityId id, String fieldName) {}
 
     Set<Object> loadManyToManyOtherIds(ManyToManyJoinTable join, Object thisId, Class<?> otherIdType) {
         String sql = "SELECT " + dialect.quoteIdentifier(join.otherColumn()) +
@@ -1406,8 +1723,8 @@ public class EntityManager {
             }
 
             EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
-            Object relatedId = relatedMeta.getIdValue(related);
-            if (relatedId != null) {
+            EntityId relatedId = relatedMeta.getEntityId(related);
+            if (relatedId.isComplete()) {
                 continue;
             }
 
@@ -1426,23 +1743,29 @@ public class EntityManager {
         // Cascade persist for collections and other relationships.
         relationshipManager.cascadePersist(entity, metadata);
 
+        EntityCallbacks callbacks = EntityCallbacks.of(entity.getClass());
+        callbacks.invoke(EntityCallbacks.Phase.PRE_PERSIST, entity);
+
         executor.insert(entity, metadata);
 
-        Object id = metadata.getIdValue(entity);
-        if (id != null) {
-            identityMap.put(new EntityKey(entity.getClass(), id), entity);
-            originalValues.put(new EntityKey(entity.getClass(), id), takeSnapshotValues(entity, metadata));
+        EntityId id = metadata.getEntityId(entity);
+        if (id.isComplete()) {
+            EntityKey key = new EntityKey(entity.getClass(), id);
+            identityMap.put(key, entity);
+            originalValues.put(key, takeSnapshotValues(entity, metadata));
             recordCacheEvent(cacheEvents, CacheKey.of(entity.getClass(), id), CacheEvent.Operation.UPSERT);
             insertedEntities.add(entity);
         }
+
+        callbacks.invoke(EntityCallbacks.Phase.POST_PERSIST, entity);
 
         visiting.remove(entity);
         processed.add(entity);
     }
 
     private void deleteManyToManyJoinRows(Object entity, EntityMetadata metadata) {
-        Object thisId = metadata.getIdValue(entity);
-        if (thisId == null) {
+        EntityId entityId = metadata.getEntityId(entity);
+        if (!entityId.isComplete()) {
             return;
         }
 
@@ -1450,6 +1773,12 @@ public class EntityManager {
             if (relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_MANY) {
                 continue;
             }
+            if (metadata.isCompositeId()) {
+                throw new UnsupportedOperationException(
+                        "ManyToMany with a composite-id owner is not supported: "
+                                + metadata.getEntityClass().getName());
+            }
+            Object thisId = entityId.singleValue();
 
             ManyToManyJoinTable join = resolveManyToManyJoinTable(metadata, relationship);
             if (join == null) {
@@ -1464,8 +1793,8 @@ public class EntityManager {
     }
 
     private void syncManyToManyJoinRows(Object entity, EntityMetadata metadata, boolean forceAll) {
-        Object thisId = metadata.getIdValue(entity);
-        if (thisId == null) {
+        EntityId entityId = metadata.getEntityId(entity);
+        if (!entityId.isComplete()) {
             return;
         }
 
@@ -1476,13 +1805,19 @@ public class EntityManager {
             if (relationship.targetEntity() == Object.class) {
                 continue;
             }
+            if (metadata.isCompositeId()) {
+                throw new UnsupportedOperationException(
+                        "ManyToMany with a composite-id owner is not supported: "
+                                + metadata.getEntityClass().getName());
+            }
+            Object thisId = entityId.singleValue();
 
             ManyToManyJoinTable join = resolveManyToManyJoinTable(metadata, relationship);
             if (join == null) {
                 continue;
             }
 
-            boolean shouldSync = forceAll || isManyToManyDirty(entity.getClass(), thisId, relationship.field());
+            boolean shouldSync = forceAll || isManyToManyDirty(entity.getClass(), entityId, relationship.field());
             if (!shouldSync) {
                 continue;
             }
@@ -1494,11 +1829,11 @@ public class EntityManager {
                 for (Object related : collection) {
                     if (related == null) continue;
                     EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
-                    Object relatedId = relatedMeta.getIdValue(related);
-                    if (relatedId == null) {
-                        throw new IllegalStateException("ManyToMany related entity has no id: " + related.getClass().getName());
+                    EntityId relatedId = relatedMeta.getEntityId(related);
+                    if (!relatedId.isComplete() || relatedMeta.isCompositeId()) {
+                        throw new IllegalStateException("ManyToMany related entity has no usable single id: " + related.getClass().getName());
                     }
-                    desired.add(relatedId);
+                    desired.add(relatedId.singleValue());
                 }
             }
 
@@ -1528,7 +1863,7 @@ public class EntityManager {
                 executor.execute(insert.getSql(), insert.getParameters());
             }
 
-            clearManyToManyDirty(entity.getClass(), thisId, relationship.field());
+            clearManyToManyDirty(entity.getClass(), entityId, relationship.field());
         }
     }
 
@@ -1556,6 +1891,12 @@ public class EntityManager {
 
         EntityMetadata ownerMeta = EntityMetadata.of(ownerClass);
         EntityMetadata inverseMeta = EntityMetadata.of(inverseClass);
+
+        if (ownerMeta.isCompositeId() || inverseMeta.isCompositeId()) {
+            throw new UnsupportedOperationException(
+                    "ManyToMany with composite-id entities is not supported (join tables use single-column keys): "
+                            + ownerMeta.getEntityClass().getName() + " <-> " + inverseMeta.getEntityClass().getName());
+        }
 
         JoinTable joinTableAnn = null;
         try {
@@ -1585,6 +1926,22 @@ public class EntityManager {
     /**
      * Create a new SELECT query builder with the dialect already configured.
      */
+    /**
+     * Create an HQL-lite query bound to this EntityManager.
+     * <p>
+     * Example: {@code em.createQuery("SELECT u FROM User u WHERE u.username = :name")
+     *   .setParameter("name", "alice").getResultList()}.
+     * <p>
+     * {@code SELECT COUNT(...)} statements return a single {@link Long} from
+     * {@code getResultList()}/{@code getSingleResult()}.
+     *
+     * @param hql the HQL-lite statement
+     * @param <T> the entity type returned by the query
+     */
+    public de.t14d3.spool.query.hql.HqlQuery createQuery(String hql) {
+        return de.t14d3.spool.query.hql.HqlQuery.parse(this, hql);
+    }
+
     public Query.SelectBuilder createSelectBuilder() {
         return Query.builder(dialect);
     }
@@ -1618,30 +1975,8 @@ public class EntityManager {
     }
 
     /**
-     * Key for the identity map, combining entity class and ID.
+     * Key for the identity map, combining entity class and id values.
      */
-    @SuppressWarnings("ClassCanBeRecord")
-    private static class EntityKey {
-        private final Class<?> entityClass;
-        private final Object id;
-
-        public EntityKey(Class<?> entityClass, Object id) {
-            this.entityClass = entityClass;
-            this.id = id;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
-            EntityKey entityKey = (EntityKey) o;
-            return Objects.equals(entityClass, entityKey.entityClass) &&
-                    Objects.equals(id, entityKey.id);
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(entityClass, id);
-        }
+    private record EntityKey(Class<?> entityClass, EntityId id) {
     }
 }

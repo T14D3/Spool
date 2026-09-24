@@ -95,7 +95,9 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("com.h2database:h2:2.2.224")
-    testImplementation("mysql:mysql-connector-java:8.0.32")
+    testImplementation("org.xerial:sqlite-jdbc:3.45.3.0")
+    testImplementation("com.mysql:mysql-connector-j:8.4.0")
+    testImplementation("org.mariadb.jdbc:mariadb-java-client:3.3.3")
 }
 
 tasks.withType<JavaCompile>().configureEach {

@@ -29,6 +29,21 @@ public enum Dialect {
     }
 
     /**
+     * Returns the SQL clause that acquires a row lock in the given mode, or
+     * null when the dialect has no supported locking clause (SQLite).
+     */
+    public String lockClause(LockMode mode) {
+        if (mode == null) {
+            throw new IllegalArgumentException("mode must not be null");
+        }
+        return switch (this) {
+            case MYSQL, POSTGRESQL -> mode == LockMode.PESSIMISTIC_READ ? "FOR SHARE" : "FOR UPDATE";
+            case SQLITE -> null;
+            case H2, GENERIC -> "FOR UPDATE";
+        };
+    }
+
+    /**
      * Escape a string literal based on the dialect.
      */
     public String escapeStringLiteral(String literal) {
@@ -48,6 +63,7 @@ public enum Dialect {
 
         String lowerUrl = jdbcUrl.toLowerCase();
         if (lowerUrl.contains("mysql")) return MYSQL;
+        if (lowerUrl.contains("mariadb")) return MYSQL;
         if (lowerUrl.contains("postgresql") || lowerUrl.contains("postgres")) return POSTGRESQL;
         if (lowerUrl.contains("sqlite")) return SQLITE;
         if (lowerUrl.contains("h2")) return H2;

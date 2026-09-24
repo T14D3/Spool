@@ -24,6 +24,7 @@ public class PersistentMigrationManager {
     private final Connection connection;
     private final SchemaIntrospector introspector;
     private final SqlGenerator sqlGenerator;
+    private final Dialect dialect;
     private final Set<Class<?>> entityClasses;
     private final Path migrationsDirectory;
 
@@ -34,7 +35,8 @@ public class PersistentMigrationManager {
     public PersistentMigrationManager(Connection connection, Path migrationsDirectory) {
         this.connection = connection;
         this.introspector = new SchemaIntrospector(connection);
-        this.sqlGenerator = new SqlGenerator(detectDialect());
+        this.dialect = detectDialect();
+        this.sqlGenerator = new SqlGenerator(dialect);
         this.entityClasses = new LinkedHashSet<>();
         this.migrationsDirectory = migrationsDirectory;
         
@@ -158,7 +160,15 @@ public class PersistentMigrationManager {
      */
     public List<String> applyPendingMigrations() throws SQLException, IOException {
         initialize();
-        
+
+        List<String> modified = verifyAppliedMigrationChecksums();
+        if (!modified.isEmpty()) {
+            throw new IllegalStateException(
+                    "Applied migration files were modified after being applied (checksum mismatch); "
+                            + "create a new migration instead:\n - "
+                            + String.join("\n - ", modified));
+        }
+
         Set<String> appliedMigrations = getAppliedMigrations();
         List<String> migrationFiles = getMigrationFiles();
         List<String> appliedMigrationsList = new ArrayList<>();
@@ -204,6 +214,45 @@ public class PersistentMigrationManager {
             }
         }
         return versions;
+    }
+
+    /**
+     * Compare the checksum recorded when each migration was applied with the
+     * checksum of the file on disk. Files that were edited after being
+     * applied are reported; empty means everything is consistent.
+     */
+    public List<String> verifyAppliedMigrationChecksums() throws SQLException, IOException {
+        Map<String, String> recorded = getAppliedMigrationChecksums();
+        List<String> mismatches = new ArrayList<>();
+        for (String filename : getMigrationFiles()) {
+            MigrationFile migration = loadMigrationFile(filename);
+            String expected = recorded.get(migration.getVersion());
+            if (expected == null) {
+                continue; // pending migration, verified when applied
+            }
+            if (!expected.equals(migration.getChecksum())) {
+                mismatches.add(filename + " (recorded " + expected + ", file " + migration.getChecksum() + ")");
+            }
+        }
+        return mismatches;
+    }
+
+    /**
+     * The checksums recorded for applied migrations, keyed by version.
+     */
+    public Map<String, String> getAppliedMigrationChecksums() throws SQLException {
+        Map<String, String> checksums = new LinkedHashMap<>();
+        if (!introspector.tableExists(MIGRATION_TABLE)) {
+            return checksums;
+        }
+        String sql = "SELECT version, checksum FROM " + MIGRATION_TABLE;
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                checksums.put(rs.getString("version"), rs.getString("checksum"));
+            }
+        }
+        return checksums;
     }
 
     /**
@@ -272,7 +321,7 @@ public class PersistentMigrationManager {
             }
         }
 
-        return SchemaDiff.compare(expectedSchema, actualSchema);
+        return SchemaDiff.compare(expectedSchema, actualSchema, dialect);
     }
 
     /**
@@ -328,11 +377,7 @@ public class PersistentMigrationManager {
      * Calculate a simple checksum for migration SQL.
      */
     private String calculateChecksum(List<String> sqlStatements) {
-        int hash = 0;
-        for (String sql : sqlStatements) {
-            hash = 31 * hash + sql.hashCode();
-        }
-        return Integer.toHexString(hash);
+        return MigrationFile.checksumOf(sqlStatements);
     }
 
     /**

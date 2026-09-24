@@ -152,7 +152,11 @@ public class Main {
                 
                 System.out.println("✓ " + className);
                 System.out.println("  Table: " + metadata.getTableName());
-                System.out.println("  ID Field: " + metadata.getIdField().getName());
+                String idFields = metadata.getIdFields().stream()
+                        .map(java.lang.reflect.Field::getName)
+                        .reduce((a, b) -> a + ", " + b)
+                        .orElse("<none>");
+                System.out.println("  ID Field(s): " + idFields);
                 System.out.println("  Fields: " + metadata.getFields().size());
                 
                 // Additional validation checks
@@ -561,10 +565,14 @@ public class Main {
         }
         
         // Check for ID field type
-        Class<?> idType = metadata.getIdField().getType();
-        if (!(idType == Long.class || idType == long.class || 
-              idType == Integer.class || idType == int.class)) {
-            warnings.add("ID field type " + idType.getSimpleName() + " - consider using Long or Integer for better compatibility");
+        if (metadata.isCompositeId()) {
+            warnings.add("Entity uses a composite id; relationships (@ManyToOne/@ManyToMany) to this entity are not supported");
+        } else {
+            Class<?> idType = metadata.getIdField().getType();
+            if (!(idType == Long.class || idType == long.class ||
+                  idType == Integer.class || idType == int.class)) {
+                warnings.add("ID field type " + idType.getSimpleName() + " - consider using Long or Integer for better compatibility");
+            }
         }
         
         // Check for reasonable field count

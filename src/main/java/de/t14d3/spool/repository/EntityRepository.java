@@ -2,6 +2,7 @@ package de.t14d3.spool.repository;
 
 import de.t14d3.spool.core.EntityManager;
 import de.t14d3.spool.mapping.EntityMetadata;
+import de.t14d3.spool.query.LockMode;
 import de.t14d3.spool.query.Query;
 
 import java.lang.reflect.Field;
@@ -106,6 +107,30 @@ public class EntityRepository<T> {
      */
     public boolean existsById(Object id) {
         return findById(id) != null;
+    }
+
+    /**
+     * Refresh an entity's state from the database, discarding in-memory changes.
+     *
+     * @param entity the entity to refresh
+     */
+    public void refresh(T entity) {
+        entityManager.refresh(entity);
+    }
+
+    /**
+     * Acquire a database row lock for an entity.
+     * <p>
+     * The lock is held until the surrounding transaction commits or rolls back,
+     * so this method must be called inside an active transaction.
+     *
+     * @param entity the entity to lock
+     * @param mode   the lock mode
+     * @return the same entity instance
+     */
+    public T lock(T entity, LockMode mode) {
+        entityManager.lock(entity, mode);
+        return entity;
     }
 
     /**

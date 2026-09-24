@@ -85,12 +85,36 @@ public class MigrationFile {
         }
 
         List<String> sqlStatements = parseSqlStatements(sqlBuilder.toString());
-        
-        LocalDateTime timestamp = timestampStr != null ? 
+
+        // Always derive the checksum from the SQL actually present in the
+        // file. The "-- Checksum:" header is informational; trusting it would
+        // make an edited file invisible to verification.
+        String computed = checksumOf(sqlStatements);
+        if (checksum != null && !checksum.equals(computed)) {
+            // The header disagrees with the SQL; keep the computed value so
+            // the mismatch is caught against the recorded checksum.
+            checksum = computed;
+        } else if (checksum == null) {
+            checksum = computed;
+        }
+
+        LocalDateTime timestamp = timestampStr != null ?
             LocalDateTime.parse(timestampStr, VERSION_FORMAT) : LocalDateTime.now();
 
         MigrationFile migration = new MigrationFile(version, description, sqlStatements, checksum, timestamp);
         return migration;
+    }
+
+    /**
+     * Checksum over the migration's SQL statements. Shared with the migration
+     * manager so generated and reloaded files hash identically.
+     */
+    public static String checksumOf(List<String> sqlStatements) {
+        int hash = 0;
+        for (String sql : sqlStatements) {
+            hash = 31 * hash + sql.hashCode();
+        }
+        return Integer.toHexString(hash);
     }
 
     /**

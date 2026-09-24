@@ -288,9 +288,7 @@ public class SqlGenerator {
         String type = column.getSqlType();
 
         // Handle type mapping for different dialects
-        if (dialect == Dialect.SQLITE) {
-            type = mapToSqliteType(type);
-        }
+        type = mapTypeForDialect(dialect, type);
 
         // MySQL requires a length for VARCHAR. Provide a sensible default when
         // the entity definition didn't specify one.
@@ -310,13 +308,45 @@ public class SqlGenerator {
             return type + "(" + column.getLength() + ")";
         }
 
+        // A bare DECIMAL/NUMERIC defaults to scale 0 on H2/MySQL/PostgreSQL
+        // and silently truncates fractions. Emit an explicit, generous
+        // precision/scale so BigDecimal values round-trip; override with
+        // @Column(type = "DECIMAL(p,s)") for a specific scale.
+        if (column.getLength() == null && type != null
+                && (type.equalsIgnoreCase("DECIMAL") || type.equalsIgnoreCase("NUMERIC"))) {
+            return type + "(38, 18)";
+        }
+
+        // MySQL/MariaDB TIMESTAMP defaults to second precision. Use
+        // microseconds so LocalDateTime/Instant/OffsetDateTime survive a
+        // round-trip; override with @Column(type = "TIMESTAMP").
+        if (dialect == Dialect.MYSQL && type != null
+                && type.equalsIgnoreCase("TIMESTAMP")) {
+            return "TIMESTAMP(6)";
+        }
+
+        return type;
+    }
+
+    /**
+     * Map a generic SQL type to the type name the dialect actually stores.
+     * Used both when generating DDL and when comparing entity metadata
+     * against introspected columns.
+     */
+    static String mapTypeForDialect(Dialect dialect, String type) {
+        if (type == null) {
+            return null;
+        }
+        if (dialect == Dialect.SQLITE) {
+            return mapToSqliteType(type);
+        }
         return type;
     }
 
     /**
      * Map SQL types to SQLite types.
      */
-    private String mapToSqliteType(String type) {
+    static String mapToSqliteType(String type) {
         type = type.toUpperCase();
         if (type.equals("BIGINT") || type.equals("INTEGER") || type.equals("SMALLINT") ||
                 type.equals("TINYINT") || type.equals("BOOLEAN")) {

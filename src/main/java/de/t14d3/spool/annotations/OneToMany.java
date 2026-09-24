@@ -26,9 +26,10 @@ public @interface OneToMany {
     String mappedBy();
 
     /**
-     * Fetch strategy for the related entities.
+     * Fetch strategy for the related entities. Defaults to LAZY: the
+     * collection is loaded from the database on first access.
      */
-    FetchType fetch() default FetchType.EAGER;
+    FetchType fetch() default FetchType.LAZY;
 
     /**
      * Cascade operations to related entities.

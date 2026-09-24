@@ -16,6 +16,7 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -190,6 +191,51 @@ public class PersistentMigrationTest {
         // Verify table still exists and schema is correct
         assertTrue(em.getMigrationManager().getIntrospector().tableExists("users"));
         System.out.println("✓ Table still exists and schema is valid");
+    }
+
+    @Test
+    @Order(98)
+    void testModifiedAppliedMigrationFileIsRejected() throws SQLException, IOException {
+        em.registerEntitiesForPersistentMigration(User.class);
+        String migrationFilename = em.createMigration("Create users table");
+        em.applyPendingMigrations();
+
+        Path migrationFile = MIGRATIONS_DIR.resolve(migrationFilename);
+        String original = Files.readString(migrationFile);
+        // Append a real statement: comments are stripped while parsing and
+        // would not change the checksum.
+        Files.writeString(migrationFile, original + "\nALTER TABLE users ADD COLUMN tampered VARCHAR(10);\n");
+
+        RuntimeException failure = assertThrows(RuntimeException.class, () -> em.applyPendingMigrations());
+        assertTrue(causeMessagesContain(failure, "checksum"),
+                "expected a checksum-mismatch failure, got: " + failure);
+    }
+
+    @Test
+    @Order(99)
+    void testPendingMigrationChecksumIsRecordedOnApply() throws SQLException, IOException {
+        em.registerEntitiesForPersistentMigration(User.class);
+        String migrationFilename = em.createMigration("Create users table");
+        em.applyPendingMigrations();
+
+        Map<String, String> recorded = em.getPersistentMigrationManager().getAppliedMigrationChecksums();
+        MigrationFile migration = em.loadMigrationFile(migrationFilename);
+        assertEquals(migration.getChecksum(), recorded.get(migration.getVersion()));
+    }
+
+    private static boolean causeMessagesContain(Throwable failure, String needle) {
+        Throwable current = failure;
+        int hops = 0;
+        while (current != null && hops++ < 16) {
+            if (current.getMessage() != null && current.getMessage().contains(needle)) {
+                return true;
+            }
+            if (current.getCause() == current) {
+                return false;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     @Test

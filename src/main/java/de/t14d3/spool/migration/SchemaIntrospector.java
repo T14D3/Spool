@@ -442,6 +442,12 @@ public class SchemaIntrospector {
         } catch (SQLException ignored) {}
 
         boolean isPrimaryKey = columnName != null && primaryKeys.contains(columnName.toLowerCase());
+        if (isPrimaryKey) {
+            // Drivers are inconsistent about reporting primary-key columns as
+            // non-null (SQLite reports nullable for INTEGER PRIMARY KEY);
+            // primary keys are never nullable in the schema Spool generates.
+            nullable = false;
+        }
         boolean isAutoIncrement = false;
         try {
             String ai = rs.getString("IS_AUTOINCREMENT");
@@ -472,7 +478,7 @@ public class SchemaIntrospector {
 
         for (Field field : metadata.getFields()) {
             String columnName = metadata.getColumnName(field);
-            boolean isPrimaryKey = field.equals(metadata.getIdField());
+            boolean isPrimaryKey = metadata.isIdField(field);
             boolean isAutoIncrement = isPrimaryKey && metadata.isAutoIncrement();
 
             // Determine SQL type from Java type
@@ -515,6 +521,10 @@ public class SchemaIntrospector {
                 Class<?> targetEntityClass = field.getType();
                 if (targetEntityClass != null) {
                     EntityMetadata targetMetadata = EntityMetadata.of(targetEntityClass);
+                    if (targetMetadata.isCompositeId()) {
+                        throw new UnsupportedOperationException(
+                                "@ManyToOne target with a composite id is not supported: " + targetEntityClass.getName());
+                    }
                     referencedTable = targetMetadata.getTableName();
 
                     JoinColumn joinColumn = field.getAnnotation(JoinColumn.class);
@@ -626,6 +636,11 @@ public class SchemaIntrospector {
             }
 
             EntityMetadata inverseMetadata = EntityMetadata.of(targetEntity);
+            if (ownerMetadata.isCompositeId() || inverseMetadata.isCompositeId()) {
+                throw new UnsupportedOperationException(
+                        "ManyToMany with composite-id entities is not supported (join tables use single-column keys): "
+                                + ownerMetadata.getEntityClass().getName() + " <-> " + targetEntity.getName());
+            }
 
             JoinTable joinTable = field.getAnnotation(JoinTable.class);
             String joinTableName = joinTable != null && !joinTable.name().isBlank()

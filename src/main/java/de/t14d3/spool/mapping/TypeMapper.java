@@ -6,8 +6,10 @@ import java.sql.Clob;
 import java.sql.Date;
 import java.sql.Time;
 import java.sql.Timestamp;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.UUID;
 
@@ -47,10 +49,15 @@ public class TypeMapper {
             return "DATE";
         } else if (javaType == LocalDateTime.class) {
             return "TIMESTAMP";
+        } else if (javaType == Instant.class || javaType == OffsetDateTime.class) {
+            return "TIMESTAMP";
         } else if (javaType == byte[].class) {
             return "BLOB";
         } else if (javaType == BigDecimal.class) {
             return "DECIMAL";
+        } else if (javaType.isEnum()) {
+            // Enums are persisted by name().
+            return "VARCHAR";
         } else {
             // For entity types (relationships), use BIGINT for foreign keys
             return "BIGINT";
@@ -111,11 +118,32 @@ public class TypeMapper {
                 return ((java.sql.Date) value).toLocalDate().atStartOfDay();
             }
         } else if (targetType == BigDecimal.class) {
-            if (value instanceof Number) {
-                return BigDecimal.valueOf(((Number) value).doubleValue());
-            } else if (value instanceof String) {
-                return new BigDecimal((String) value);
+            if (value instanceof BigDecimal decimal) {
+                return decimal;
             }
+            // Go through the string representation to avoid the precision
+            // loss of a double round-trip (DECIMAL columns).
+            return new BigDecimal(value.toString());
+        } else if (targetType == Instant.class) {
+            return toInstant(value);
+        } else if (targetType == OffsetDateTime.class) {
+            return toInstant(value).atOffset(java.time.ZoneOffset.UTC);
+        } else if (targetType.isEnum()) {
+            if (targetType.isInstance(value)) {
+                return value;
+            }
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            Class<? extends Enum> enumType = (Class<? extends Enum>) targetType;
+            if (value instanceof Number number) {
+                Object[] constants = targetType.getEnumConstants();
+                int ordinal = number.intValue();
+                if (ordinal < 0 || ordinal >= constants.length) {
+                    throw new IllegalArgumentException(
+                            "Ordinal " + ordinal + " is out of range for enum " + targetType.getName());
+                }
+                return constants[ordinal];
+            }
+            return Enum.valueOf(enumType, value.toString());
         } else if (targetType == byte[].class) {
             if (value instanceof Blob) {
                 try {
@@ -126,8 +154,31 @@ public class TypeMapper {
             }
         }
 
-        // For types we don't explicitly handle (e.g., enums, custom types), return as-is
+        // For types we don't explicitly handle (custom types), return as-is
         // and let reflection handle it, which may succeed or fail appropriately.
         return value;
+    }
+
+    private static Instant toInstant(Object value) {
+        if (value instanceof Instant instant) {
+            return instant;
+        }
+        if (value instanceof Timestamp timestamp) {
+            return timestamp.toInstant();
+        }
+        if (value instanceof OffsetDateTime offsetDateTime) {
+            return offsetDateTime.toInstant();
+        }
+        if (value instanceof LocalDateTime localDateTime) {
+            return localDateTime.atZone(ZoneId.systemDefault()).toInstant();
+        }
+        if (value instanceof java.util.Date date) {
+            return date.toInstant();
+        }
+        if (value instanceof CharSequence text) {
+            return Instant.parse(text.toString());
+        }
+        throw new IllegalArgumentException(
+                "Cannot convert " + value.getClass().getName() + " to Instant");
     }
 }

@@ -1,6 +1,7 @@
 package de.t14d3.spool.migration;
 
 import de.t14d3.spool.mapping.UniqueConstraintDef;
+import de.t14d3.spool.query.Dialect;
 
 import java.util.*;
 
@@ -134,6 +135,18 @@ public class SchemaDiff {
      * @return A SchemaDiff containing all necessary changes
      */
     public static SchemaDiff compare(Map<String, TableDefinition> expected, Map<String, TableDefinition> actual) {
+        return compare(expected, actual, Dialect.GENERIC);
+    }
+
+    /**
+     * Compare expected schema (from entities) with actual schema (from database),
+     * normalizing type names for the given dialect (SQLite stores
+     * {@code BIGINT} as {@code INTEGER}, {@code VARCHAR} as {@code TEXT}, and
+     * so on).
+     */
+    public static SchemaDiff compare(Map<String, TableDefinition> expected,
+                                     Map<String, TableDefinition> actual,
+                                     Dialect dialect) {
         SchemaDiff diff = new SchemaDiff();
 
         // Find tables to create (in expected but not in actual)
@@ -146,7 +159,7 @@ public class SchemaDiff {
             } else {
                 // Table exists, compare columns
                 TableDefinition actualTable = actual.get(tableName);
-                compareColumns(diff, expectedTable, actualTable);
+                compareColumns(diff, expectedTable, actualTable, dialect);
                 compareUniqueConstraints(diff, expectedTable, actualTable);
             }
         }
@@ -165,7 +178,8 @@ public class SchemaDiff {
     /**
      * Compare columns between expected and actual table definitions.
      */
-    private static void compareColumns(SchemaDiff diff, TableDefinition expected, TableDefinition actual) {
+    private static void compareColumns(SchemaDiff diff, TableDefinition expected, TableDefinition actual,
+                                       Dialect dialect) {
         String tableName = expected.getName();
 
         // Find columns to add (case-insensitive comparison)
@@ -178,7 +192,7 @@ public class SchemaDiff {
             } else {
                 // Column exists, check if it needs modification
                 ColumnDefinition actualColumn = actual.getColumn(columnName);
-                if (needsModification(expectedColumn, actualColumn)) {
+                if (needsModification(expectedColumn, actualColumn, dialect)) {
                     diff.addChange(SchemaChange.modifyColumn(tableName, expectedColumn, actualColumn));
                 }
             }
@@ -256,10 +270,10 @@ public class SchemaDiff {
     /**
      * Check if a column needs modification.
      */
-    private static boolean needsModification(ColumnDefinition expected, ColumnDefinition actual) {
+    private static boolean needsModification(ColumnDefinition expected, ColumnDefinition actual, Dialect dialect) {
         // Compare SQL types (normalize for comparison)
-        String expectedType = normalizeType(expected.getSqlType());
-        String actualType = normalizeType(actual.getSqlType());
+        String expectedType = normalizeType(expected.getSqlType(), dialect);
+        String actualType = normalizeType(actual.getSqlType(), dialect);
 
         if (!expectedType.equals(actualType)) {
             return true;
@@ -270,8 +284,10 @@ public class SchemaDiff {
             return true;
         }
 
-        // Compare length for VARCHAR types
-        if (expected.getLength() != null && actual.getLength() != null) {
+        // Compare length for VARCHAR types. SQLite has no meaningful column
+        // length (all text is TEXT) and ignores the declared length in DDL.
+        if (dialect != Dialect.SQLITE
+                && expected.getLength() != null && actual.getLength() != null) {
             if (!expected.getLength().equals(actual.getLength())) {
                 return true;
             }
@@ -283,8 +299,9 @@ public class SchemaDiff {
     /**
      * Normalize SQL type names for comparison.
      */
-    private static String normalizeType(String type) {
+    private static String normalizeType(String type, Dialect dialect) {
         if (type == null) return "";
+        type = SqlGenerator.mapTypeForDialect(dialect, type);
         type = type.toUpperCase();
 
         // Normalize common type variations
@@ -294,6 +311,17 @@ public class SchemaDiff {
         if (type.equals("BOOL")) return "BOOLEAN";
         if (type.startsWith("VARCHAR")) return "VARCHAR";
         if (type.startsWith("CHARACTER VARYING")) return "VARCHAR";
+        // JDBC drivers report expanded names for these (H2 uses
+        // "DOUBLE PRECISION" / "BINARY LARGE OBJECT").
+        if (type.equals("DOUBLE PRECISION") || type.equals("FLOAT8") || type.equals("REAL")) {
+            return "DOUBLE";
+        }
+        if (type.equals("BINARY LARGE OBJECT") || type.equals("BYTEA") || type.endsWith("BLOB")) {
+            return "BLOB";
+        }
+        if (type.equals("NUMERIC")) return "DECIMAL";
+        // MySQL/MariaDB store BOOLEAN as TINYINT(1) and report TINYINT.
+        if (dialect == Dialect.MYSQL && type.equals("BOOLEAN")) return "TINYINT";
 
         return type;
     }

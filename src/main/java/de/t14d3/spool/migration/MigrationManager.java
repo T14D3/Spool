@@ -115,7 +115,7 @@ public class MigrationManager {
         }
 
         // Compare and generate diff
-        SchemaDiff diff = SchemaDiff.compare(expectedSchema, actualSchema);
+        SchemaDiff diff = SchemaDiff.compare(expectedSchema, actualSchema, dialect);
 
         // Generate SQL, then interleave the per-table post-create statements
         // (CREATE UNIQUE INDEX on SQLite, where the inline CREATE TABLE
@@ -157,7 +157,7 @@ public class MigrationManager {
             }
         }
 
-        return SchemaDiff.compare(expectedSchema, actualSchema);
+        return SchemaDiff.compare(expectedSchema, actualSchema, dialect);
     }
 
     /**

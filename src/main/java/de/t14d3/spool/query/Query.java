@@ -84,10 +84,21 @@ public class Query {
         private final Dialect dialect;
         private final List<String> columns = new ArrayList<>();
         private String fromTable;
+        private String fromAlias;
+        private final List<String> joins = new ArrayList<>();
         private final StringBuilder whereClause = new StringBuilder();
         private final List<Object> parameters = new ArrayList<>();
         private String orderBy;
         private String limit;
+        private String offset;
+        private String lockClause;
+
+        /**
+         * A portable "no upper bound" limit for offset-only pagination.
+         * MySQL requires a LIMIT before OFFSET; the other supported dialects
+         * accept this value too.
+         */
+        private static final String UNBOUNDED_LIMIT = "9223372036854775807";
 
         public SelectBuilder(Dialect dialect) {
             this.dialect = dialect;
@@ -100,6 +111,27 @@ public class Query {
 
         public SelectBuilder from(String table) {
             this.fromTable = table;
+            return this;
+        }
+
+        /**
+         * Set the FROM table with an explicit SQL alias.
+         */
+        public SelectBuilder from(String table, String alias) {
+            this.fromTable = table;
+            this.fromAlias = alias;
+            return this;
+        }
+
+        /**
+         * Append a raw JOIN clause. The caller is responsible for quoting the
+         * joined table, alias and ON expression (the HQL translator does this
+         * through {@link Dialect#quoteIdentifier(String)}).
+         */
+        public SelectBuilder join(String clause) {
+            if (clause != null && !clause.isBlank()) {
+                joins.add(clause);
+            }
             return this;
         }
 
@@ -124,6 +156,23 @@ public class Query {
             return this;
         }
 
+        /**
+         * Skip the first {@code offset} rows. Works with or without an
+         * explicit {@link #limit(String)}.
+         */
+        public SelectBuilder offset(String offset) {
+            this.offset = offset;
+            return this;
+        }
+
+        /**
+         * Append a raw locking clause such as {@code FOR UPDATE}.
+         */
+        public SelectBuilder lock(String clause) {
+            this.lockClause = clause;
+            return this;
+        }
+
         public Query build() {
             if (columns.isEmpty()) {
                 throw new IllegalStateException("SELECT query must specify columns");
@@ -140,6 +189,13 @@ public class Query {
             sql.append(columnList);
 
             sql.append(" FROM ").append(dialect.quoteIdentifier(fromTable));
+            if (fromAlias != null && !fromAlias.isBlank()) {
+                sql.append(" ").append(dialect.quoteIdentifier(fromAlias));
+            }
+
+            for (String join : joins) {
+                sql.append(" ").append(join);
+            }
 
             if (!whereClause.isEmpty()) {
                 sql.append(" WHERE ").append(whereClause);
@@ -151,6 +207,17 @@ public class Query {
 
             if (limit != null && !limit.trim().isEmpty()) {
                 sql.append(" LIMIT ").append(limit);
+            }
+
+            if (offset != null && !offset.trim().isEmpty()) {
+                if (limit == null || limit.trim().isEmpty()) {
+                    sql.append(" LIMIT ").append(UNBOUNDED_LIMIT);
+                }
+                sql.append(" OFFSET ").append(offset);
+            }
+
+            if (lockClause != null && !lockClause.isBlank()) {
+                sql.append(" ").append(lockClause);
             }
 
             return new Query(dialect, sql, parameters);

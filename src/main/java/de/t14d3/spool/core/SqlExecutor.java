@@ -1,14 +1,17 @@
 package de.t14d3.spool.core;
 
 import de.t14d3.spool.annotations.ManyToOne;
+import de.t14d3.spool.mapping.EntityId;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.query.Dialect;
 import de.t14d3.spool.query.Query;
 
 import java.lang.reflect.Field;
 import java.sql.*;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Date;
@@ -106,11 +109,33 @@ public class SqlExecutor {
     // High-level ORM operations using Query builders
     // ---------------------------------------------------------------------
 
+    /**
+     * Builds an {@code AND}-joined primary-key predicate and appends the id
+     * values to {@code params}. Supports single-column and composite ids.
+     */
+    public static String idWhere(Dialect dialect, EntityMetadata metadata, EntityId id, List<Object> params) {
+        List<Field> idFields = metadata.getIdFields();
+        List<Object> values = id.values();
+        StringBuilder condition = new StringBuilder();
+        for (int i = 0; i < idFields.size(); i++) {
+            if (i > 0) {
+                condition.append(" AND ");
+            }
+            condition.append(dialect.quoteIdentifier(metadata.getColumnName(idFields.get(i)))).append(" = ?");
+            params.add(values.get(i));
+        }
+        return condition.toString();
+    }
+
     public <T> T findById(Class<T> entityClass, Object id) {
         EntityMetadata metadata = EntityMetadata.of(entityClass);
+        EntityId entityId = metadata.getEntityIdFrom(id);
+
+        List<Object> params = new ArrayList<>();
+        String condition = idWhere(dialect, metadata, entityId, params);
         Query q = Query.select(dialect, "*")
                 .from(metadata.getTableName())
-                .where(metadata.getIdColumnName() + " = ?", id)
+                .where(condition, params.toArray())
                 .build();
 
         try (PreparedStatement stmt = connection.prepareStatement(q.getSql())) {
@@ -123,6 +148,42 @@ public class SqlExecutor {
             return null;
         } catch (SQLException e) {
             throw new RuntimeException("Failed to find entity by ID: " + id, e);
+        }
+    }
+
+    /**
+     * Load entities by a list of single-column ids in one {@code IN} query.
+     * Used for batch prefetching of eager relations.
+     */
+    public <T> List<T> findByIds(Class<T> entityClass, List<Object> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return new ArrayList<>();
+        }
+        EntityMetadata metadata = EntityMetadata.of(entityClass);
+        String column = dialect.quoteIdentifier(metadata.getIdColumnName());
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < ids.size(); i++) {
+            if (i > 0) {
+                placeholders.append(", ");
+            }
+            placeholders.append('?');
+        }
+        Query q = Query.select(dialect, "*")
+                .from(metadata.getTableName())
+                .where(column + " IN (" + placeholders + ")", ids.toArray())
+                .build();
+
+        List<T> results = new ArrayList<>();
+        try (PreparedStatement stmt = connection.prepareStatement(q.getSql())) {
+            setParameters(stmt, q.getParameters());
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    results.add(mapResultSetToEntity(rs, metadata));
+                }
+            }
+            return results;
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to find entities by ids for " + entityClass.getName(), e);
         }
     }
 
@@ -148,9 +209,13 @@ public class SqlExecutor {
 
     public boolean existsById(Class<?> entityClass, Object id) {
         EntityMetadata metadata = EntityMetadata.of(entityClass);
+        EntityId entityId = metadata.getEntityIdFrom(id);
+
+        List<Object> params = new ArrayList<>();
+        String condition = idWhere(dialect, metadata, entityId, params);
         Query q = Query.select(dialect, "1")
                 .from(metadata.getTableName())
-                .where(metadata.getIdColumnName() + " = ?", id)
+                .where(condition, params.toArray())
                 .limit("1")
                 .build();
 
@@ -165,13 +230,15 @@ public class SqlExecutor {
     }
 
     public void delete(Object entity, EntityMetadata metadata) {
-        Object id = metadata.getIdValue(entity);
-        if (id == null) {
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
             return;
         }
 
+        List<Object> params = new ArrayList<>();
+        String condition = idWhere(dialect, metadata, id, params);
         Query q = Query.deleteFrom(dialect, metadata.getTableName())
-                .where(metadata.getIdColumnName() + " = ?", id)
+                .where(condition, params.toArray())
                 .build();
 
         executeUpdate(q.getSql(), q.getParameters());
@@ -188,15 +255,24 @@ public class SqlExecutor {
     }
 
     public void insert(Object entity, EntityMetadata metadata) {
-        Object idVal = metadata.getIdValue(entity);
-        boolean shouldGenerateId = isUnsetAutoIncrementId(metadata, idVal);
+        boolean shouldGenerateId = false;
+        if (metadata.isAutoIncrement()) {
+            shouldGenerateId = isUnsetAutoIncrementId(metadata, metadata.getIdValue(entity));
+        }
+
+        if (metadata.hasVersion()) {
+            Field versionField = metadata.getVersionField();
+            if (metadata.getFieldValue(entity, versionField) == null) {
+                metadata.setFieldValue(entity, versionField, zeroVersion(versionField.getType()));
+            }
+        }
 
         List<String> cols = new ArrayList<>();
         List<Object> vals = new ArrayList<>();
 
         for (Field field : metadata.getFields()) {
             // Skip auto-generated id when unset (null or 0).
-            if (field.equals(metadata.getIdField()) && shouldGenerateId) {
+            if (metadata.isIdField(field) && shouldGenerateId) {
                 continue;
             }
 
@@ -236,45 +312,131 @@ public class SqlExecutor {
         }
     }
 
-    public void update(Object entity, EntityMetadata metadata, Map<Field, Object> snapshot) {
+    /**
+     * The value used for dirty comparison. {@code ManyToOne} fields are
+     * represented by the referenced entity's id in the snapshot, so the
+     * entity object must be normalized before comparing.
+     */
+    static Object comparableFieldValue(EntityMetadata metadata, Field field, Object entity) {
+        Object value = metadata.getFieldValue(entity, field);
+        if (value == null) {
+            return null;
+        }
+        if (field.isAnnotationPresent(ManyToOne.class)) {
+            EntityMetadata relatedMeta = EntityMetadata.of(value.getClass());
+            if (relatedMeta.isCompositeId()) {
+                return value;
+            }
+            return relatedMeta.getIdValue(value);
+        }
+        return value;
+    }
+
+    /**
+     * Returns true when at least one mapped non-id column of {@code entity}
+     * differs from the value captured in {@code snapshot}. A null snapshot
+     * means "no baseline available" and always counts as dirty.
+     */
+    public static boolean hasChanges(Object entity, EntityMetadata metadata, Map<Field, Object> snapshot) {
+        if (snapshot == null) {
+            return true;
+        }
+        for (Field field : metadata.getFields()) {
+            if (metadata.isIdField(field)) continue;
+
+            Object current = comparableFieldValue(metadata, field, entity);
+            Object original = snapshot.get(field);
+            if (!Objects.deepEquals(current, original)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Update an entity's dirty columns.
+     *
+     * @return true when an UPDATE statement was executed, false when the
+     *         entity had no changes and was skipped
+     */
+    public boolean update(Object entity, EntityMetadata metadata, Map<Field, Object> snapshot) {
         Query.UpdateBuilder ub = Query.update(dialect, metadata.getTableName());
         boolean hasSnapshot = snapshot != null;
         boolean isDirty = false;
         for (Field field : metadata.getFields()) {
-            if (field.equals(metadata.getIdField())) continue;
+            if (metadata.isIdField(field)) continue;
 
-            Object current = metadata.getFieldValue(entity, field);
+            Object comparable = comparableFieldValue(metadata, field, entity);
             Object original = hasSnapshot ? snapshot.get(field) : null;
 
-            if (!hasSnapshot || !Objects.equals(current, original)) {
-                if (field.isAnnotationPresent(ManyToOne.class)) {
-                    Object related = metadata.getFieldValue(entity, field);
-                    if (related == null) {
-                        ub.set(metadata.getColumnName(field), null);
-                    } else {
-                        EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
-                        ub.set(metadata.getColumnName(field), relatedMeta.getIdValue(related));
-                    }
-                } else {
-                    ub.set(metadata.getColumnName(field), current);
-                }
+            if (!hasSnapshot || !Objects.deepEquals(comparable, original)) {
+                ub.set(metadata.getColumnName(field), comparable);
                 isDirty = true;
             }
         }
 
         // If no fields to update (no changes), skip the update
         if (!isDirty) {
-            return;
+            return false;
         }
 
-        Object idValue = metadata.getIdValue(entity);
-        if (idValue == null) {
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
             throw new IllegalStateException("Cannot update entity without id: " + metadata.getEntityClass().getName());
         }
 
-        ub.where(metadata.getIdColumnName() + " = ?", idValue);
+        Field versionField = metadata.getVersionField();
+        Object previousVersion = null;
+        Object nextVersion = null;
+        if (versionField != null) {
+            previousVersion = metadata.getFieldValue(entity, versionField);
+            if (previousVersion == null) {
+                throw new IllegalStateException(
+                        "Cannot update entity with a null @Version value: " + metadata.getEntityClass().getName());
+            }
+            nextVersion = incrementVersion(previousVersion, versionField.getType());
+            ub.set(metadata.getColumnName(versionField), nextVersion);
+        }
+
+        List<Object> params = new ArrayList<>();
+        String condition = idWhere(dialect, metadata, id, params);
+        ub.where(condition, params.toArray());
+        if (versionField != null) {
+            ub.where(dialect.quoteIdentifier(metadata.getColumnName(versionField)) + " = ?", previousVersion);
+        }
+
         Query q = ub.build();
-        executeUpdate(q.getSql(), q.getParameters());
+        int affected = executeUpdate(q.getSql(), q.getParameters());
+        if (affected == 0) {
+            throw new de.t14d3.spool.OptimisticLockException(
+                    metadata.getEntityClass(), id.values(),
+                    "Update matched no row for " + metadata.getEntityClass().getName() + "#" + id
+                            + (versionField != null
+                            ? "; the row was modified by another transaction (version mismatch)"
+                            : "; the row was deleted by another transaction"));
+        }
+        if (versionField != null) {
+            metadata.setFieldValue(entity, versionField, nextVersion);
+        }
+        return true;
+    }
+
+    private static Object zeroVersion(Class<?> versionType) {
+        if (versionType == long.class || versionType == Long.class) return 0L;
+        if (versionType == int.class || versionType == Integer.class) return 0;
+        if (versionType == short.class || versionType == Short.class) return (short) 0;
+        throw new IllegalArgumentException("Unsupported @Version type: " + versionType.getName());
+    }
+
+    private static Object incrementVersion(Object current, Class<?> versionType) {
+        if (!(current instanceof Number number)) {
+            throw new IllegalArgumentException(
+                    "@Version value must be numeric, got " + current.getClass().getName());
+        }
+        if (versionType == long.class || versionType == Long.class) return number.longValue() + 1L;
+        if (versionType == int.class || versionType == Integer.class) return number.intValue() + 1;
+        if (versionType == short.class || versionType == Short.class) return (short) (number.shortValue() + 1);
+        throw new IllegalArgumentException("Unsupported @Version type: " + versionType.getName());
     }
 
     // ---------------------------------------------------------------------
@@ -306,6 +468,11 @@ public class SqlExecutor {
                     metadata.setFieldValue(entity, field, null);
                 } else {
                     EntityMetadata relatedMeta = EntityMetadata.of(field.getType());
+                    if (relatedMeta.isCompositeId()) {
+                        throw new UnsupportedOperationException(
+                                "@ManyToOne target with a composite id is not supported: "
+                                        + field.getType().getName());
+                    }
                     Object related = relatedMeta.newInstance();
                     Object convertedId = de.t14d3.spool.mapping.TypeMapper.convertToJavaType(raw, relatedMeta.getIdField().getType());
                     relatedMeta.setIdValue(related, convertedId);
@@ -347,6 +514,8 @@ public class SqlExecutor {
                 case Date date -> stmt.setTimestamp(idx, new Timestamp(date.getTime()));
                 case LocalDate localDate -> stmt.setDate(idx, java.sql.Date.valueOf(localDate));
                 case LocalDateTime localDateTime -> stmt.setTimestamp(idx, Timestamp.valueOf(localDateTime));
+                case Instant instant -> stmt.setTimestamp(idx, Timestamp.from(instant));
+                case OffsetDateTime offsetDateTime -> stmt.setTimestamp(idx, Timestamp.from(offsetDateTime.toInstant()));
                 case UUID uuid -> stmt.setString(idx, uuid.toString());
                 case Enum<?> anEnum -> stmt.setString(idx, anEnum.name());
                 default ->

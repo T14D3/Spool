@@ -18,13 +18,17 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class EntityMetadata {
     private static final Map<Class<?>, EntityMetadata> METADATA_CACHE = new ConcurrentHashMap<>();
+    private static final Map<String, Class<?>> ENTITY_NAMES = new ConcurrentHashMap<>();
 
     private final Class<?> entityClass;
     private final String tableName;
+    private final List<Field> idFields;
     private final Field idField;
+    private final Field versionField;
     private final boolean autoIncrement;
     private final List<Field> fields;
     private final Map<String, Field> columnToField;
+    private final Map<String, Field> nameToField;
     private final Map<Field, String> fieldToColumn;
     private final Map<Field, String> fieldToColumnType;
     private final List<UniqueConstraintDef> uniqueConstraints;
@@ -37,6 +41,16 @@ public class EntityMetadata {
             throw new IllegalArgumentException("Class " + entityClass.getName() + " is not annotated with @Entity");
         }
 
+        // Register resolvable entity names (simple name and FQCN) for HQL.
+        ENTITY_NAMES.putIfAbsent(entityClass.getSimpleName(), entityClass);
+        ENTITY_NAMES.putIfAbsent(entityClass.getName(), entityClass);
+
+        this.nameToField = new HashMap<>();
+        for (Field field : entityClass.getDeclaredFields()) {
+            field.setAccessible(true);
+            nameToField.putIfAbsent(field.getName(), field);
+        }
+
         // Extract table name
         Table tableAnnotation = entityClass.getAnnotation(Table.class);
         this.tableName = (tableAnnotation != null) ? tableAnnotation.name() : entityClass.getSimpleName().toLowerCase();
@@ -47,17 +61,39 @@ public class EntityMetadata {
         this.fieldToColumn = new HashMap<>();
         this.fieldToColumnType = new HashMap<>();
         this.uniqueConstraints = new ArrayList<>();
-        Field foundIdField = null;
+        List<Field> idFields = new ArrayList<>();
         boolean foundAutoIncrement = false;
+        Field foundVersionField = null;
 
         for (Field field : entityClass.getDeclaredFields()) {
             field.setAccessible(true);
 
+            if (field.isAnnotationPresent(de.t14d3.spool.annotations.Version.class)) {
+                if (field.isAnnotationPresent(Id.class)) {
+                    throw new IllegalArgumentException(
+                            "Entity " + entityClass.getName() + " cannot use @Version on an @Id field");
+                }
+                Class<?> versionType = field.getType();
+                if (!(versionType == int.class || versionType == long.class || versionType == short.class
+                        || versionType == Integer.class || versionType == Long.class || versionType == Short.class)) {
+                    throw new IllegalArgumentException(
+                            "Entity " + entityClass.getName() + " has an unsupported @Version type "
+                                    + versionType.getName() + "; use int, long, short or their wrappers");
+                }
+                if (foundVersionField != null) {
+                    throw new IllegalArgumentException(
+                            "Entity " + entityClass.getName() + " declares more than one @Version field");
+                }
+                foundVersionField = field;
+            }
+
             if (field.isAnnotationPresent(Id.class)) {
-                foundIdField = field;
+                idFields.add(field);
                 Id idAnnotation = field.getAnnotation(Id.class);
-                foundAutoIncrement = idAnnotation.autoIncrement();
-                
+                if (idAnnotation.autoIncrement()) {
+                    foundAutoIncrement = true;
+                }
+
                 // Add ID field to fields list - it has a column
                 if (field.isAnnotationPresent(Column.class)) {
                     Column column = field.getAnnotation(Column.class);
@@ -106,12 +142,32 @@ public class EntityMetadata {
             }
         }
 
-        if (foundIdField == null) {
+        if (idFields.isEmpty()) {
             throw new IllegalArgumentException("Entity " + entityClass.getName() + " must have a field annotated with @Id");
         }
+        if (idFields.size() > 1 && foundAutoIncrement) {
+            throw new IllegalArgumentException(
+                    "Entity " + entityClass.getName() + " has a composite id; generated (autoIncrement) ids are only "
+                            + "supported for single-column ids");
+        }
+        Set<String> idColumns = new HashSet<>();
+        for (Field idFieldCandidate : idFields) {
+            String column = null;
+            if (idFieldCandidate.isAnnotationPresent(Column.class)) {
+                column = idFieldCandidate.getAnnotation(Column.class).name();
+            } else {
+                column = idFieldCandidate.getName();
+            }
+            if (!idColumns.add(column.toLowerCase())) {
+                throw new IllegalArgumentException(
+                        "Entity " + entityClass.getName() + " maps more than one @Id field to column '" + column + "'");
+            }
+        }
 
-        this.idField = foundIdField;
-        this.autoIncrement = foundAutoIncrement;
+        this.idFields = List.copyOf(idFields);
+        this.idField = idFields.get(0);
+        this.versionField = foundVersionField;
+        this.autoIncrement = idFields.size() == 1 && foundAutoIncrement;
 
         // Collect single-column unique constraints (@Column(unique = true)).
         for (Field field : fields) {
@@ -162,6 +218,28 @@ public class EntityMetadata {
         return METADATA_CACHE.computeIfAbsent(entityClass, EntityMetadata::new);
     }
 
+    /**
+     * Resolve an entity class by its simple name or fully qualified class name.
+     * Entity classes become resolvable as soon as their metadata is built
+     * (which happens both lazily and eagerly via
+     * {@code EntityManager.registerEntities}). Returns null when the name
+     * cannot be resolved.
+     */
+    public static Class<?> resolveEntityClass(String name) {
+        if (name == null || name.isBlank()) {
+            return null;
+        }
+        Class<?> registered = ENTITY_NAMES.get(name);
+        if (registered != null) {
+            return registered;
+        }
+        try {
+            return Class.forName(name);
+        } catch (ClassNotFoundException e) {
+            return null;
+        }
+    }
+
     public Class<?> getEntityClass() {
         return entityClass;
     }
@@ -170,12 +248,65 @@ public class EntityMetadata {
         return tableName;
     }
 
+    /**
+     * The single {@code @Id} field. Only valid for entities with a
+     * single-column id; throws for composite ids.
+     */
     public Field getIdField() {
+        if (idFields.size() != 1) {
+            throw new IllegalStateException(
+                    "Entity " + entityClass.getName() + " has a composite id (" + idFields.size()
+                            + " @Id fields); getIdField() is only valid for single-column ids");
+        }
         return idField;
     }
 
+    /**
+     * All {@code @Id} fields, in declaration order.
+     */
+    public List<Field> getIdFields() {
+        return idFields;
+    }
+
+    public boolean isCompositeId() {
+        return idFields.size() > 1;
+    }
+
+    /**
+     * True when the given field is one of the entity's {@code @Id} fields.
+     */
+    public boolean isIdField(Field field) {
+        return idFields.contains(field);
+    }
+
+    /**
+     * The {@code @Version} field, or null when the entity does not use
+     * optimistic locking.
+     */
+    public Field getVersionField() {
+        return versionField;
+    }
+
+    public boolean hasVersion() {
+        return versionField != null;
+    }
+
+    /**
+     * Single id column name. Only valid for entities with a single-column id.
+     */
     public String getIdColumnName() {
-        return fieldToColumn.get(idField);
+        return fieldToColumn.get(getIdField());
+    }
+
+    /**
+     * All id column names, in {@code @Id} field order.
+     */
+    public List<String> getIdColumnNames() {
+        List<String> columns = new ArrayList<>(idFields.size());
+        for (Field field : idFields) {
+            columns.add(fieldToColumn.get(field));
+        }
+        return columns;
     }
 
     public boolean isAutoIncrement() {
@@ -192,6 +323,14 @@ public class EntityMetadata {
 
     public Field getField(String columnName) {
         return columnToField.get(columnName);
+    }
+
+    /**
+     * Get a declared field by its Java name (not column name). Returns null
+     * when no such field exists.
+     */
+    public Field getFieldByName(String fieldName) {
+        return nameToField.get(fieldName);
     }
 
     /**
@@ -212,14 +351,42 @@ public class EntityMetadata {
     }
 
     /**
-     * Gets the ID value from an entity instance.
+     * Gets the identity of an entity instance, covering both single-column and
+     * composite ids.
+     */
+    public EntityId getEntityId(Object entity) {
+        return EntityId.of(this, entity);
+    }
+
+    /**
+     * Builds an identity from a user-supplied key (raw value, {@code Map} or
+     * entity instance). See {@link EntityId#from(EntityMetadata, Object)}.
+     */
+    public EntityId getEntityIdFrom(Object key) {
+        return EntityId.from(this, key);
+    }
+
+    /**
+     * All id values from an entity instance, in {@code @Id} field order.
+     */
+    public List<Object> getIdValues(Object entity) {
+        List<Object> values = new ArrayList<>(idFields.size());
+        for (Field field : idFields) {
+            values.add(getFieldValue(entity, field));
+        }
+        return values;
+    }
+
+    /**
+     * Gets the single ID value from an entity instance. Throws for composite
+     * ids; use {@link #getEntityId(Object)} instead.
      */
     public Object getIdValue(Object entity) {
-        try {
-            return idField.get(entity);
-        } catch (IllegalAccessException e) {
-            throw new RuntimeException("Cannot access ID field", e);
+        if (idFields.size() != 1) {
+            throw new IllegalStateException(
+                    "Entity " + entityClass.getName() + " has a composite id; use getEntityId() or getIdValues()");
         }
+        return getFieldValue(entity, idField);
     }
 
     /**
