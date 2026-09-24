@@ -9,6 +9,7 @@ import de.t14d3.spool.annotations.ManyToOne;
 import de.t14d3.spool.annotations.MappedSuperclass;
 import de.t14d3.spool.annotations.OneToMany;
 import de.t14d3.spool.annotations.OneToOne;
+import de.t14d3.spool.annotations.OrderBy;
 import de.t14d3.spool.annotations.Table;
 import de.t14d3.spool.annotations.UniqueConstraint;
 
@@ -251,6 +252,7 @@ public class EntityMetadata {
                             + "@OneToMany needs @JoinColumn(name=\"...\") to name the FK column on "
                             + oneToMany.targetEntity().getSimpleName());
                 }
+                validateOrderBy(field, oneToMany.targetEntity());
                 return;
             }
             if (joinColumn != null) {
@@ -270,6 +272,7 @@ public class EntityMetadata {
                         + oneToMany.targetEntity().getName() + "." + mappedBy
                         + " is not annotated with @ManyToOne");
             }
+            validateOrderBy(field, oneToMany.targetEntity());
             return;
         }
 
@@ -300,6 +303,7 @@ public class EntityMetadata {
                             + target.getName() + "." + mappedBy + " is not a @ManyToMany collection");
                 }
             }
+            validateOrderBy(field, target);
             return;
         }
 
@@ -325,6 +329,43 @@ public class EntityMetadata {
                             + field.getType().getName() + "." + oneToOne.mappedBy()
                             + " is itself an inverse side (its mappedBy is set); mappedBy must point at the owning side");
                 }
+            }
+            return;
+        }
+
+        if (field.isAnnotationPresent(OrderBy.class)) {
+            throw new IllegalArgumentException("Entity " + declaring.getName() + " @OrderBy is only valid on "
+                    + "@OneToMany/@ManyToMany fields, but '" + field.getName() + "' is not a collection relationship");
+        }
+    }
+
+    private static void validateOrderBy(Field field, Class<?> targetEntity) {
+        OrderBy orderBy = field.getAnnotation(OrderBy.class);
+        if (orderBy == null || orderBy.value().isBlank()) {
+            return;
+        }
+        Class<?> declaring = field.getDeclaringClass();
+        for (String segment : orderBy.value().split(",")) {
+            String[] tokens = segment.trim().split("\\s+");
+            if (tokens.length == 0 || tokens.length > 2
+                    || (tokens.length == 2
+                    && !tokens[1].equalsIgnoreCase("ASC") && !tokens[1].equalsIgnoreCase("DESC"))) {
+                throw new IllegalArgumentException("Entity " + declaring.getName() + " @OrderBy on field '"
+                        + field.getName() + "' must be 'field [ASC|DESC][, ...]', found '" + segment.trim() + "'");
+            }
+            Field ordered = findField(targetEntity, tokens[0]);
+            if (ordered == null) {
+                throw new IllegalArgumentException("Entity " + declaring.getName() + " @OrderBy on field '"
+                        + field.getName() + "' references unknown field " + targetEntity.getName() + "." + tokens[0]);
+            }
+            boolean columnMapped = ordered.isAnnotationPresent(Column.class)
+                    || ordered.isAnnotationPresent(Id.class)
+                    || ordered.isAnnotationPresent(de.t14d3.spool.annotations.ManyToOne.class)
+                    || isOwningToOne(ordered);
+            if (!columnMapped) {
+                throw new IllegalArgumentException("Entity " + declaring.getName() + " @OrderBy on field '"
+                        + field.getName() + "' references " + targetEntity.getName() + "." + tokens[0]
+                        + ", which is not a mapped column");
             }
         }
     }

@@ -318,7 +318,8 @@ public class RelationshipManager {
                     annotation.mappedBy(),
                     annotation.fetch(),
                     annotation.cascade(),
-                    fkColumn
+                    fkColumn,
+                    annotationOrderBy(field)
             );
         }
 
@@ -358,11 +359,18 @@ public class RelationshipManager {
                     RelationshipMapping.RelationshipType.MANY_TO_MANY,
                     annotation.mappedBy(),
                     annotation.fetch(),
-                    annotation.cascade()
+                    annotation.cascade(),
+                    "",
+                    annotationOrderBy(field)
             );
         }
 
         return null;
+    }
+
+    private static String annotationOrderBy(Field field) {
+        de.t14d3.spool.annotations.OrderBy orderBy = field.getAnnotation(de.t14d3.spool.annotations.OrderBy.class);
+        return orderBy != null ? orderBy.value() : "";
     }
 
     /**
@@ -652,6 +660,61 @@ public class RelationshipManager {
         }
     }
 
+    /**
+     * Resolves an {@code @OrderBy} value to a SQL ORDER BY clause for the given
+     * target metadata. {@code tableAlias} prefixes columns when the query joins
+     * the target table (M2M pair queries).
+     */
+    private String orderByClause(RelationshipMapping relationship, EntityMetadata targetMeta, String tableAlias) {
+        String orderBy = relationship.orderBy();
+        if (orderBy == null || orderBy.isBlank()) {
+            return null;
+        }
+        List<String> parts = new ArrayList<>();
+        for (String segment : orderBy.split(",")) {
+            String[] tokens = segment.trim().split("\\s+");
+            String fieldName = tokens[0];
+            boolean descending = tokens.length > 1 && tokens[1].equalsIgnoreCase("DESC");
+            Field ordered = EntityMetadata.findField(targetMeta.getEntityClass(), fieldName);
+            String column = ordered == null ? null : targetMeta.getColumnName(ordered);
+            if (column == null) {
+                throw new IllegalStateException("@OrderBy references an unmapped field: "
+                        + targetMeta.getEntityClass().getName() + "." + fieldName);
+            }
+            String prefix = tableAlias == null ? "" : tableAlias + ".";
+            parts.add(prefix + column + (descending ? " DESC" : " ASC"));
+        }
+        return String.join(", ", parts);
+    }
+
+    private Set<Object> loadOrderedManyToManyOtherIds(
+            EntityManager.ManyToManyJoinTable join,
+            EntityMetadata targetMeta,
+            Object thisId,
+            Class<?> otherIdType,
+            String order) {
+        Query query = Query.select(entityManager.getDialect(), "j." + join.otherColumn())
+                .from(join.joinTable(), "j")
+                .join("JOIN " + entityManager.getDialect().quoteIdentifier(targetMeta.getTableName())
+                        + " t ON t." + entityManager.getDialect().quoteIdentifier(targetMeta.getIdColumnName())
+                        + " = j." + entityManager.getDialect().quoteIdentifier(join.otherColumn()))
+                .where("j." + entityManager.getDialect().quoteIdentifier(join.thisColumn()) + " = ?", thisId)
+                .orderBy(order)
+                .build();
+        Set<Object> ids = new LinkedHashSet<>();
+        try (PreparedStatement stmt = entityManager.getExecutor().getConnection().prepareStatement(query.getSql())) {
+            SqlExecutor.setParameters(stmt, query.getParameters());
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    ids.add(TypeMapper.convertToJavaType(rs.getObject(1), otherIdType));
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to load ordered " + join.joinTable() + " rows", e);
+        }
+        return ids;
+    }
+
     private static EntityMetadata metadataFor(Object entity) {
         return EntityMetadata.of(entity.getClass());
     }
@@ -684,8 +747,11 @@ public class RelationshipManager {
         }
         Map<Object, List<Object>> childIdsByOwner = loadPairIds(
                 targetMeta.getTableName(),
+                null,
                 fkColumn,
                 targetMeta.getIdColumnName(),
+                null,
+                orderByClause(relationship, targetMeta, null),
                 ownerIds,
                 metadata.getIdField().getType(),
                 targetMeta.getIdField().getType());
@@ -705,10 +771,20 @@ public class RelationshipManager {
         for (Object parent : parents) {
             ownerIds.add(metadata.getIdValue(parent));
         }
+        String order = orderByClause(relationship, targetMeta, "t");
+        String tableAlias = order == null ? null : "j";
+        String joinClause = order == null
+                ? null
+                : "JOIN " + entityManager.getDialect().quoteIdentifier(targetMeta.getTableName())
+                        + " t ON t." + entityManager.getDialect().quoteIdentifier(targetMeta.getIdColumnName())
+                        + " = j." + entityManager.getDialect().quoteIdentifier(join.otherColumn());
         Map<Object, List<Object>> otherIdsByOwner = loadPairIds(
                 join.joinTable(),
+                tableAlias,
                 join.thisColumn(),
                 join.otherColumn(),
+                joinClause,
+                order,
                 ownerIds,
                 metadata.getIdField().getType(),
                 targetMeta.getIdField().getType());
@@ -750,24 +826,39 @@ public class RelationshipManager {
 
     /**
      * Loads {@code (fk, id)} pairs from {@code table} where the FK column is in
-     * {@code ownerIds}, chunked to keep IN lists small.
+     * {@code ownerIds}, chunked to keep IN lists small. An optional table alias,
+     * JOIN clause and ORDER BY support M2M pair queries ordered by target
+     * columns.
      */
     private Map<Object, List<Object>> loadPairIds(
             String table,
+            String tableAlias,
             String fkColumn,
             String idColumn,
+            String joinClause,
+            String orderBy,
             List<Object> ownerIds,
             Class<?> fkType,
             Class<?> idType) {
         Map<Object, List<Object>> grouped = new LinkedHashMap<>();
+        String columnPrefix = tableAlias == null ? "" : tableAlias + ".";
         for (int i = 0; i < ownerIds.size(); i += 500) {
             List<Object> chunk = ownerIds.subList(i, Math.min(i + 500, ownerIds.size()));
             String placeholders = String.join(", ", Collections.nCopies(chunk.size(), "?"));
-            Query query = Query.select(entityManager.getDialect(), fkColumn, idColumn)
-                    .from(table)
-                    .where(entityManager.getDialect().quoteIdentifier(fkColumn) + " IN (" + placeholders + ")",
-                            chunk.toArray())
-                    .build();
+            Query.SelectBuilder builder = tableAlias == null
+                    ? Query.select(entityManager.getDialect(), fkColumn, idColumn)
+                            .from(table)
+                    : Query.select(entityManager.getDialect(), tableAlias + "." + fkColumn, tableAlias + "." + idColumn)
+                            .from(table, tableAlias);
+            if (joinClause != null) {
+                builder.join(joinClause);
+            }
+            builder.where(columnPrefix + entityManager.getDialect().quoteIdentifier(fkColumn)
+                    + " IN (" + placeholders + ")", chunk.toArray());
+            if (orderBy != null) {
+                builder.orderBy(orderBy);
+            }
+            Query query = builder.build();
             try (PreparedStatement stmt = entityManager.getExecutor().getConnection().prepareStatement(query.getSql())) {
                 SqlExecutor.setParameters(stmt, query.getParameters());
                 try (ResultSet rs = stmt.executeQuery()) {
@@ -954,10 +1045,14 @@ public class RelationshipManager {
             }
         }
 
-        Query q = Query.select(entityManager.getDialect(), "*")
+        Query.SelectBuilder builder = Query.select(entityManager.getDialect(), "*")
                 .from(targetMeta.getTableName())
-                .where(entityManager.getDialect().quoteIdentifier(fkColumn) + " = ?", ownerId)
-                .build();
+                .where(entityManager.getDialect().quoteIdentifier(fkColumn) + " = ?", ownerId);
+        String orderBy = orderByClause(relationship, targetMeta, null);
+        if (orderBy != null) {
+            builder.orderBy(orderBy);
+        }
+        Query q = builder.build();
 
         @SuppressWarnings("unchecked")
         List<Object> children = (List<Object>) (List<?>) entityManager.executeSelectQuery(q, targetEntity);
@@ -1060,7 +1155,10 @@ public class RelationshipManager {
 
         EntityMetadata otherMeta = EntityMetadata.of(relationship.targetEntity());
         Class<?> otherIdType = otherMeta.getIdField().getType();
-        Set<Object> otherIds = entityManager.loadManyToManyOtherIds(join, thisId, otherIdType);
+        String order = orderByClause(relationship, otherMeta, "t");
+        Set<Object> otherIds = order == null
+                ? entityManager.loadManyToManyOtherIds(join, thisId, otherIdType)
+                : loadOrderedManyToManyOtherIds(join, otherMeta, thisId, otherIdType, order);
 
         List<Object> relatedEntities = new ArrayList<>();
         for (Object otherId : otherIds) {

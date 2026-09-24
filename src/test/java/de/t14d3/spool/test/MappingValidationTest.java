@@ -5,8 +5,10 @@ import de.t14d3.spool.annotations.Entity;
 import de.t14d3.spool.annotations.Id;
 import de.t14d3.spool.annotations.JoinColumn;
 import de.t14d3.spool.annotations.ManyToMany;
+import de.t14d3.spool.annotations.ManyToOne;
 import de.t14d3.spool.annotations.OneToMany;
 import de.t14d3.spool.annotations.OneToOne;
+import de.t14d3.spool.annotations.OrderBy;
 import de.t14d3.spool.mapping.EntityMetadata;
 import org.junit.jupiter.api.Test;
 
@@ -77,6 +79,20 @@ public class MappingValidationTest {
         IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
                 () -> EntityMetadata.of(MappedByWithJoinColumnOwner.class));
         assertTrue(ex.getMessage().contains("both mappedBy"), ex.getMessage());
+    }
+
+    @Test
+    void orderByUnknownFieldFailsAtMetadataBuild() {
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> EntityMetadata.of(OrderByUnknownFieldOwner.class));
+        assertTrue(ex.getMessage().contains("missing"), ex.getMessage());
+    }
+
+    @Test
+    void orderByOnSingleReferenceFailsAtMetadataBuild() {
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> EntityMetadata.of(OrderByOnManyToOneOwner.class));
+        assertTrue(ex.getMessage().contains("@OrderBy"), ex.getMessage());
     }
 
     @Test
@@ -187,6 +203,29 @@ public class MappingValidationTest {
         @OneToMany(targetEntity = Target.class, mappedBy = "owner")
         @JoinColumn(name = "owner_id")
         private List<Target> children = new ArrayList<>();
+    }
+
+    @Entity
+    static class OrderByUnknownFieldOwner {
+        @Id(autoIncrement = true)
+        @Column(name = "id")
+        private Long id;
+
+        @OneToMany(targetEntity = Target.class, mappedBy = "")
+        @JoinColumn(name = "owner_id")
+        @OrderBy("missing DESC")
+        private List<Target> children = new ArrayList<>();
+    }
+
+    @Entity
+    static class OrderByOnManyToOneOwner {
+        @Id(autoIncrement = true)
+        @Column(name = "id")
+        private Long id;
+
+        @ManyToOne
+        @OrderBy("name")
+        private Target target;
     }
 
     @Entity

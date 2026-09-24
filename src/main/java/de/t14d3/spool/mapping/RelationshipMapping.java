@@ -13,12 +13,16 @@ import java.lang.reflect.Field;
  *                   {@code @ManyToOne}/{@code @OneToOne} FK column is tracked
  *                   by {@link EntityMetadata}
  */
-public record RelationshipMapping(Field field, Class<?> targetEntity, RelationshipType relationshipType, String mappedBy, FetchType fetch, CascadeType[] cascadeTypes, String joinColumn) {
+public record RelationshipMapping(Field field, Class<?> targetEntity, RelationshipType relationshipType, String mappedBy, FetchType fetch, CascadeType[] cascadeTypes, String joinColumn, String orderBy) {
     public RelationshipMapping(Field field, Class<?> targetEntity, RelationshipType relationshipType, String mappedBy, FetchType fetch, CascadeType[] cascadeTypes) {
-        this(field, targetEntity, relationshipType, mappedBy, fetch, cascadeTypes, "");
+        this(field, targetEntity, relationshipType, mappedBy, fetch, cascadeTypes, "", "");
     }
 
     public RelationshipMapping(Field field, Class<?> targetEntity, RelationshipType relationshipType, String mappedBy, FetchType fetch, CascadeType[] cascadeTypes, String joinColumn) {
+        this(field, targetEntity, relationshipType, mappedBy, fetch, cascadeTypes, joinColumn, "");
+    }
+
+    public RelationshipMapping(Field field, Class<?> targetEntity, RelationshipType relationshipType, String mappedBy, FetchType fetch, CascadeType[] cascadeTypes, String joinColumn, String orderBy) {
         this.field = field;
         this.targetEntity = targetEntity;
         this.relationshipType = relationshipType;
@@ -26,6 +30,7 @@ public record RelationshipMapping(Field field, Class<?> targetEntity, Relationsh
         this.fetch = fetch != null ? fetch : FetchType.LAZY;
         this.cascadeTypes = cascadeTypes != null ? cascadeTypes : new CascadeType[0];
         this.joinColumn = joinColumn != null ? joinColumn : "";
+        this.orderBy = orderBy != null ? orderBy : "";
     }
 
     public boolean isCascadable(CascadeType cascadeType) {
