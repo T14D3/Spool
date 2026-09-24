@@ -580,21 +580,10 @@ public class EntityManager implements AutoCloseable {
                 inserts.removeIf(deleteSet::contains);
 
                 // Filter out entities that were explicitly detached.
-                // Auto-increment entities with id=0 or null are NEW, not detached.
-                inserts.removeIf(e -> {
-                    EntityMetadata meta = EntityMetadata.of(e.getClass());
-                    EntityId id = meta.getEntityId(e);
-                    if (!id.isComplete()) return false;
-                    // Entities with an explicit ID that was never managed are new - keep them.
-                    // Only filter if the entity was explicitly detached via detach().
-                    if (meta.isAutoIncrement()) {
-                        Object idValue = id.singleValue();
-                        if (idValue instanceof Number n && n.longValue() == 0L) {
-                            return false;
-                        }
-                    }
-                    return detachedEntities.contains(e);
-                });
+                // detachedEntities uses identity equality, so only the exact
+                // detached instance is skipped; a different instance with the
+                // same id is a new insert.
+                inserts.removeIf(detachedEntities::contains);
 
                 // ── Process deletes ──────────────────────────────────────
                 Set<Object> processedDeletes = Collections.newSetFromMap(new IdentityHashMap<>());
