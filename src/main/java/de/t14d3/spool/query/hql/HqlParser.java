@@ -50,6 +50,8 @@ final class HqlParser {
     private final List<HqlLexer.Token> tokens;
     private final List<HqlQuery.ParamRef> params = new ArrayList<>();
     private final Map<String, String> joinAliases = new LinkedHashMap<>();
+    private final Map<String, EntityMetadata> aliasMetadata = new LinkedHashMap<>();
+    private final Map<String, String> sqlAliases = new LinkedHashMap<>();
 
     private int index;
     private int joinCounter;
@@ -83,6 +85,8 @@ final class HqlParser {
         }
         baseMetadata = EntityMetadata.of(entityClass);
         baseAlias = expect(HqlLexer.Kind.IDENT).text();
+        aliasMetadata.put(baseAlias, baseMetadata);
+        sqlAliases.put(baseAlias, baseAlias);
 
         // A single bare alias selects the entity itself: SELECT u FROM User u.
         if (!entitySelect && projections.size() == 1
@@ -103,6 +107,69 @@ final class HqlParser {
                 && ("*".equals(projections.get(0).path()) || projections.get(0).path().equals(baseAlias));
 
         builder = Query.select(dialect).from(baseMetadata.getTableName(), baseAlias);
+
+        List<HqlQuery.FetchPath> fetchPaths = new ArrayList<>();
+        while (peekKind(0) == HqlLexer.Kind.JOIN
+                || peekKind(0) == HqlLexer.Kind.LEFT
+                || peekKind(0) == HqlLexer.Kind.INNER) {
+            boolean leftJoin = false;
+            if (peekKind(0) == HqlLexer.Kind.JOIN) {
+                index++;
+            } else {
+                leftJoin = peekKind(0) == HqlLexer.Kind.LEFT;
+                index++;
+                expect(HqlLexer.Kind.JOIN);
+            }
+
+            if (match(HqlLexer.Kind.FETCH)) {
+                String fetchAlias = expect(HqlLexer.Kind.IDENT).text();
+                if (!fetchAlias.equals(baseAlias)) {
+                    throw new HqlException(
+                            "JOIN FETCH alias '" + fetchAlias + "' does not match FROM alias '" + baseAlias + "'");
+                }
+                expect(HqlLexer.Kind.DOT);
+                String fieldName = expect(HqlLexer.Kind.IDENT).text();
+                Field field = baseMetadata.getFieldByName(fieldName);
+                if (field == null) {
+                    throw new HqlException("Unknown field for JOIN FETCH: " + baseAlias + "." + fieldName);
+                }
+                if (!field.isAnnotationPresent(ManyToOne.class)
+                        && !field.isAnnotationPresent(OneToOne.class)
+                        && !field.isAnnotationPresent(OneToMany.class)
+                        && !field.isAnnotationPresent(ManyToMany.class)) {
+                    throw new HqlException("JOIN FETCH target is not a relationship: "
+                            + baseAlias + "." + fieldName);
+                }
+                fetchPaths.add(new HqlQuery.FetchPath(entityClass, fieldName));
+                continue;
+            }
+
+            // Explicit alias join: JOIN <alias>.<path> <joinAlias>.
+            String sourceAlias = expect(HqlLexer.Kind.IDENT).text();
+            expect(HqlLexer.Kind.DOT);
+            String fieldName = expect(HqlLexer.Kind.IDENT).text();
+            String joinAlias = expect(HqlLexer.Kind.IDENT).text();
+            EntityMetadata source = aliasMetadata.get(sourceAlias);
+            if (source == null) {
+                throw new HqlException("Unknown entity alias '" + sourceAlias + "'");
+            }
+            Field field = source.getFieldByName(fieldName);
+            if (field == null) {
+                throw new HqlException("Unknown field '" + fieldName + "' on "
+                        + source.getEntityClass().getSimpleName());
+            }
+            if (!field.isAnnotationPresent(ManyToOne.class) && !field.isAnnotationPresent(OneToOne.class)) {
+                throw new HqlException("Cannot join '" + sourceAlias + "." + fieldName
+                        + "' with an alias: only @ManyToOne and @OneToOne joins are supported");
+            }
+            if (aliasMetadata.containsKey(joinAlias) || joinAlias.equals(baseAlias)) {
+                throw new HqlException("Duplicate entity alias '" + joinAlias + "'");
+            }
+            joinFor(sourceAlias, source, field, fieldName, leftJoin);
+            aliasMetadata.put(joinAlias, EntityMetadata.of(field.getType()));
+            sqlAliases.put(joinAlias, joinAliases.get(sourceAlias + "." + fieldName));
+        }
+
         if (entitySelect) {
             builder.select("*");
         } else {
@@ -111,38 +178,6 @@ final class HqlParser {
                 columns.add(resolveProjection(projection));
             }
             builder.select(columns.toArray(new String[0]));
-        }
-
-        List<HqlQuery.FetchPath> fetchPaths = new ArrayList<>();
-        while (peekKind(0) == HqlLexer.Kind.JOIN
-                || peekKind(0) == HqlLexer.Kind.LEFT
-                || peekKind(0) == HqlLexer.Kind.INNER) {
-            if (peekKind(0) == HqlLexer.Kind.JOIN) {
-                index++;
-            } else {
-                index++;
-                expect(HqlLexer.Kind.JOIN);
-            }
-            expect(HqlLexer.Kind.FETCH);
-            String fetchAlias = expect(HqlLexer.Kind.IDENT).text();
-            if (!fetchAlias.equals(baseAlias)) {
-                throw new HqlException(
-                        "JOIN FETCH alias '" + fetchAlias + "' does not match FROM alias '" + baseAlias + "'");
-            }
-            expect(HqlLexer.Kind.DOT);
-            String fieldName = expect(HqlLexer.Kind.IDENT).text();
-            Field field = baseMetadata.getFieldByName(fieldName);
-            if (field == null) {
-                throw new HqlException("Unknown field for JOIN FETCH: " + baseAlias + "." + fieldName);
-            }
-            if (!field.isAnnotationPresent(ManyToOne.class)
-                    && !field.isAnnotationPresent(OneToOne.class)
-                    && !field.isAnnotationPresent(OneToMany.class)
-                    && !field.isAnnotationPresent(ManyToMany.class)) {
-                throw new HqlException("JOIN FETCH target is not a relationship: "
-                        + baseAlias + "." + fieldName);
-            }
-            fetchPaths.add(new HqlQuery.FetchPath(entityClass, fieldName));
         }
 
         if (match(HqlLexer.Kind.WHERE)) {
@@ -224,13 +259,14 @@ final class HqlParser {
             return "*";
         }
         String[] parts = path.split("\\.");
-        if (!parts[0].equals(baseAlias)) {
+        EntityMetadata start = aliasMetadata.get(parts[0]);
+        if (start == null) {
             throw new HqlException("Unknown entity alias '" + parts[0] + "'; expected '" + baseAlias + "'");
         }
         if (parts.length < 2) {
-            throw new HqlException("Expected a field path after alias '" + baseAlias + "'");
+            throw new HqlException("Expected a field path after alias '" + parts[0] + "'");
         }
-        return resolvePathSegments(baseMetadata, baseAlias,
+        return resolvePathSegments(start, sqlAliases.get(parts[0]),
                 new ArrayList<>(Arrays.asList(parts).subList(1, parts.length)), quoted);
     }
 
@@ -383,7 +419,8 @@ final class HqlParser {
 
     private String parsePath(boolean quoted) {
         HqlLexer.Token first = expect(HqlLexer.Kind.IDENT);
-        if (!first.text().equals(baseAlias)) {
+        EntityMetadata start = aliasMetadata.get(first.text());
+        if (start == null) {
             throw new HqlException("Unknown entity alias '" + first.text() + "'", first.position());
         }
 
@@ -393,9 +430,9 @@ final class HqlParser {
         }
         if (segments.isEmpty()) {
             throw new HqlException(
-                    "Expected a field path after alias '" + baseAlias + "'", first.position());
+                    "Expected a field path after alias '" + first.text() + "'", first.position());
         }
-        return resolvePathSegments(baseMetadata, baseAlias, segments, quoted);
+        return resolvePathSegments(start, sqlAliases.get(first.text()), segments, quoted);
     }
 
     private String parseGroupBy() {
@@ -443,13 +480,14 @@ final class HqlParser {
                                 + metadata.getEntityClass().getSimpleName()
                                 + ": only @ManyToOne and @OneToOne paths are supported");
             }
-            alias = joinFor(alias, metadata, field, segment);
+            alias = joinFor(alias, metadata, field, segment, false);
             metadata = EntityMetadata.of(field.getType());
         }
         throw new IllegalStateException("Unreachable: path resolution must return");
     }
 
-    private String joinFor(String currentAlias, EntityMetadata currentMetadata, Field field, String fieldName) {
+    private String joinFor(String currentAlias, EntityMetadata currentMetadata, Field field, String fieldName,
+                           boolean leftJoin) {
         String key = currentAlias + "." + fieldName;
         String existing = joinAliases.get(key);
         if (existing != null) {
@@ -484,7 +522,8 @@ final class HqlParser {
             }
         }
 
-        builder.join("JOIN " + quote(targetMetadata.getTableName()) + " " + quote(joinAlias) + " ON " + on);
+        builder.join((leftJoin ? "LEFT JOIN " : "JOIN ")
+                + quote(targetMetadata.getTableName()) + " " + quote(joinAlias) + " ON " + on);
         joinAliases.put(key, joinAlias);
         return joinAlias;
     }
