@@ -85,6 +85,18 @@ java {
     withJavadocJar()
 }
 
+val processorSourceSet = sourceSets.create("processor") {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+
+val processorJar = tasks.register<Jar>("processorJar") {
+    group = "build"
+    description = "Assembles the opt-in annotation processor artifact."
+    archiveClassifier.set("processor")
+    from(processorSourceSet.output)
+}
+
 dependencies {
 
     implementation("org.reflections:reflections:0.10.2")
@@ -94,6 +106,7 @@ dependencies {
     testImplementation(platform("org.junit:junit-bom:5.10.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testImplementation(processorSourceSet.output)
     testImplementation("com.h2database:h2:2.2.224")
     testImplementation("org.xerial:sqlite-jdbc:3.45.3.0")
     testImplementation("com.mysql:mysql-connector-j:8.4.0")
@@ -146,6 +159,7 @@ publishing {
             artifactId = "spool"
             from(components["java"])
             artifact(fatJar)
+            artifact(processorJar)
         }
     }
 
