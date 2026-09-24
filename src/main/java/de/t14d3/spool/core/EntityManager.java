@@ -2682,9 +2682,6 @@ public class EntityManager implements AutoCloseable {
     // ========================================================================
 
     /**
-     * Create a new SELECT query builder with the dialect already configured.
-     */
-    /**
      * Create an HQL-lite query bound to this EntityManager.
      * <p>
      * Example: {@code em.createQuery("SELECT u FROM User u WHERE u.username = :name")
@@ -2694,7 +2691,6 @@ public class EntityManager implements AutoCloseable {
      * {@code getResultList()}/{@code getSingleResult()}.
      *
      * @param hql the HQL-lite statement
-     * @param <T> the entity type returned by the query
      */
     public de.t14d3.spool.query.hql.HqlQuery createQuery(String hql) {
         return de.t14d3.spool.query.hql.HqlQuery.parse(this, hql);

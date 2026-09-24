@@ -199,7 +199,7 @@ public class EntityRepository<T> {
                 Object value = entry.getValue();
                 String columnName = getColumnNameByField(fieldName);
                 if (columnName != null) {
-                    builder.where(columnName + " = ?", value);
+                    builder.where(entityManager.getDialect().quoteIdentifier(columnName) + " = ?", value);
                 } else {
                     throw new IllegalArgumentException("Unknown field: " + fieldName);
                 }
@@ -311,7 +311,7 @@ public class EntityRepository<T> {
             Object value = entry.getValue();
             String columnName = getColumnNameByField(fieldName);
             if (columnName != null) {
-                builder.where(columnName + " = ?", value);
+                builder.where(entityManager.getDialect().quoteIdentifier(columnName) + " = ?", value);
             } else {
                 throw new IllegalArgumentException("Unknown field: " + fieldName);
             }
