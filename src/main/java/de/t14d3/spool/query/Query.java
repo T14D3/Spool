@@ -226,8 +226,9 @@ public class Query {
         private String quoteColumn(String col) {
             if (col == null) return "";
             String trimmed = col.trim();
-            // if it's a wildcard or contains a function call or an expression/alias, leave as-is
-            if ("*".equals(trimmed) || trimmed.contains("(") || containsAsClause(trimmed)) {
+            // if it's a wildcard, a numeric literal, a function call or an expression/alias, leave as-is
+            if ("*".equals(trimmed) || trimmed.matches("\\d+")
+                    || trimmed.contains("(") || containsAsClause(trimmed)) {
                 return trimmed;
             }
             // handle qualified names like schema.table or table.column

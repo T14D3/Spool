@@ -106,7 +106,10 @@ public class EntityRepository<T> {
      * @return true if an entity with the given ID exists, false otherwise
      */
     public boolean existsById(Object id) {
-        return findById(id) != null;
+        if (entityManager.isManaged(entityClass, id)) {
+            return true;
+        }
+        return entityManager.getExecutor().existsById(entityClass, id);
     }
 
     /**
@@ -170,25 +173,92 @@ public class EntityRepository<T> {
      * @return a list of entities matching the criteria
      */
     public List<T> findBy(Map<String, Object> criteria) {
-        if (criteria == null || criteria.isEmpty()) {
-            return findAll();
-        }
+        return findBy(criteria, null, null, null);
+    }
 
+    /**
+     * Find entities by criteria with ordering and pagination.
+     * <p>
+     * {@code orderBy} is a comma-separated list of field names with an optional
+     * {@code ASC}/{@code DESC} suffix (for example {@code "name DESC, id ASC"}).
+     * {@code limit} and {@code offset} may be null to leave the clause out;
+     * offset-only pagination is supported on every dialect.
+     *
+     * @param criteria a map of field names to values; may be null or empty
+     * @param orderBy  ordering expression, or null
+     * @param limit    maximum number of rows, or null
+     * @param offset   number of rows to skip, or null/0
+     * @return a list of entities matching the criteria
+     */
+    public List<T> findBy(Map<String, Object> criteria, String orderBy, Integer limit, Integer offset) {
         Query.SelectBuilder builder = Query.select(entityManager.getDialect(), "*").from(metadata.getTableName());
 
-        for (Map.Entry<String, Object> entry : criteria.entrySet()) {
-            String fieldName = entry.getKey();
-            Object value = entry.getValue();
-            String columnName = getColumnNameByField(fieldName);
-            if (columnName != null) {
-                builder.where(columnName + " = ?", value);
-            } else {
-                throw new IllegalArgumentException("Unknown field: " + fieldName);
+        if (criteria != null) {
+            for (Map.Entry<String, Object> entry : criteria.entrySet()) {
+                String fieldName = entry.getKey();
+                Object value = entry.getValue();
+                String columnName = getColumnNameByField(fieldName);
+                if (columnName != null) {
+                    builder.where(columnName + " = ?", value);
+                } else {
+                    throw new IllegalArgumentException("Unknown field: " + fieldName);
+                }
             }
         }
 
-        Query query = builder.build();
-        return executeSelectQuery(query);
+        if (orderBy != null && !orderBy.isBlank()) {
+            builder.orderBy(resolveOrderBy(orderBy));
+        }
+        if (limit != null) {
+            if (limit < 1) {
+                throw new IllegalArgumentException("limit must be >= 1");
+            }
+            builder.limit(Integer.toString(limit));
+        }
+        if (offset != null && offset > 0) {
+            builder.offset(Integer.toString(offset));
+        }
+
+        return executeSelectQuery(builder.build());
+    }
+
+    /**
+     * Find entities by criteria with ordering.
+     */
+    public List<T> findBy(Map<String, Object> criteria, String orderBy) {
+        return findBy(criteria, orderBy, null, null);
+    }
+
+    /**
+     * Find entities by a single field value with ordering and pagination.
+     */
+    public List<T> findBy(String field, Object value, String orderBy, Integer limit, Integer offset) {
+        return findBy(Map.of(field, value), orderBy, limit, offset);
+    }
+
+    private String resolveOrderBy(String orderBy) {
+        StringBuilder resolved = new StringBuilder();
+        for (String segment : orderBy.split(",")) {
+            String[] tokens = segment.trim().split("\\s+");
+            if (tokens.length == 0 || tokens.length > 2
+                    || (tokens.length == 2
+                    && !tokens[1].equalsIgnoreCase("ASC") && !tokens[1].equalsIgnoreCase("DESC"))) {
+                throw new IllegalArgumentException(
+                        "orderBy must be 'field [ASC|DESC][, ...]', found '" + segment.trim() + "'");
+            }
+            String columnName = getColumnNameByField(tokens[0]);
+            if (columnName == null) {
+                throw new IllegalArgumentException("Unknown order field: " + tokens[0]);
+            }
+            if (resolved.length() > 0) {
+                resolved.append(", ");
+            }
+            resolved.append(columnName);
+            if (tokens.length == 2) {
+                resolved.append(tokens[1].equalsIgnoreCase("DESC") ? " DESC" : " ASC");
+            }
+        }
+        return resolved.toString();
     }
 
     /**
