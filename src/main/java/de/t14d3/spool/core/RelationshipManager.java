@@ -280,7 +280,7 @@ public class RelationshipManager {
     private List<RelationshipMapping> getRelationships(EntityMetadata metadata) {
         return relationshipCache.computeIfAbsent(metadata.getEntityClass(), cls -> {
             List<RelationshipMapping> relationships = new ArrayList<>();
-            for (Field field : cls.getDeclaredFields()) {
+            for (Field field : metadata.getHierarchyFields()) {
                 RelationshipMapping relationship = createRelationshipMapping(field, metadata);
                 if (relationship != null) {
                     relationships.add(relationship);
@@ -495,7 +495,7 @@ public class RelationshipManager {
         Class<?> targetEntity = relationship.targetEntity();
         EntityMetadata targetMeta = EntityMetadata.of(targetEntity);
 
-        Field mappedByField = findField(targetEntity, relationship.mappedBy());
+        Field mappedByField = EntityMetadata.findField(targetEntity, relationship.mappedBy());
         if (mappedByField == null) {
             throw new IllegalStateException("OneToMany mappedBy field not found: " + targetEntity.getName() + "." + relationship.mappedBy());
         }
@@ -908,38 +908,30 @@ public class RelationshipManager {
     private static Field resolveManyToManyInverseField(Class<?> ownerEntity, Field ownerField, Class<?> targetEntity, String mappedBy) {
         if (mappedBy != null && !mappedBy.isBlank()) {
             // This side is inverse; mappedBy points to the owning field on the target entity.
-            return findField(targetEntity, mappedBy);
+            return EntityMetadata.findField(targetEntity, mappedBy);
         }
 
         // Owning side; find inverse field on target that maps back to this field name.
         String ownerFieldName = ownerField.getName();
-        for (Field f : targetEntity.getDeclaredFields()) {
-            if (!f.isAnnotationPresent(de.t14d3.spool.annotations.ManyToMany.class)) {
-                continue;
+        for (Class<?> c = targetEntity; c != null && c != Object.class; c = c.getSuperclass()) {
+            for (Field f : c.getDeclaredFields()) {
+                if (!f.isAnnotationPresent(de.t14d3.spool.annotations.ManyToMany.class)) {
+                    continue;
+                }
+                var ann = f.getAnnotation(de.t14d3.spool.annotations.ManyToMany.class);
+                if (!ownerFieldName.equals(ann.mappedBy())) {
+                    continue;
+                }
+                if (!Collection.class.isAssignableFrom(f.getType())) {
+                    continue;
+                }
+                f.setAccessible(true);
+                return f;
             }
-            var ann = f.getAnnotation(de.t14d3.spool.annotations.ManyToMany.class);
-            if (!ownerFieldName.equals(ann.mappedBy())) {
-                continue;
-            }
-            if (!Collection.class.isAssignableFrom(f.getType())) {
-                continue;
-            }
-            f.setAccessible(true);
-            return f;
         }
 
         // No bidirectional mapping found.
         return null;
-    }
-
-    private static Field findField(Class<?> type, String fieldName) {
-        try {
-            Field f = type.getDeclaredField(fieldName);
-            f.setAccessible(true);
-            return f;
-        } catch (NoSuchFieldException e) {
-            return null;
-        }
     }
 
     /**

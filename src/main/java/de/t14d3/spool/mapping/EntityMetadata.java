@@ -6,6 +6,7 @@ import de.t14d3.spool.annotations.Id;
 import de.t14d3.spool.annotations.JoinColumn;
 import de.t14d3.spool.annotations.ManyToMany;
 import de.t14d3.spool.annotations.ManyToOne;
+import de.t14d3.spool.annotations.MappedSuperclass;
 import de.t14d3.spool.annotations.OneToMany;
 import de.t14d3.spool.annotations.OneToOne;
 import de.t14d3.spool.annotations.Table;
@@ -13,6 +14,7 @@ import de.t14d3.spool.annotations.UniqueConstraint;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.util.*;
@@ -32,6 +34,7 @@ public class EntityMetadata {
     private final Field versionField;
     private final boolean autoIncrement;
     private final List<Field> fields;
+    private final List<Field> hierarchyFields;
     private final Map<String, Field> columnToField;
     private final Map<String, Field> nameToField;
     private final Map<Field, String> fieldToColumn;
@@ -51,10 +54,19 @@ public class EntityMetadata {
         ENTITY_NAMES.putIfAbsent(entityClass.getName(), entityClass);
 
         this.nameToField = new HashMap<>();
-        for (Field field : entityClass.getDeclaredFields()) {
-            field.setAccessible(true);
-            nameToField.putIfAbsent(field.getName(), field);
+        Map<String, Field> hierarchy = new LinkedHashMap<>();
+        for (Class<?> mappedClass : collectMappedClasses(entityClass)) {
+            for (Field declared : mappedClass.getDeclaredFields()) {
+                if (Modifier.isStatic(declared.getModifiers()) || declared.isSynthetic()) {
+                    continue;
+                }
+                declared.setAccessible(true);
+                // Subclass declarations shadow superclass fields of the same name.
+                hierarchy.put(declared.getName(), declared);
+            }
         }
+        this.hierarchyFields = List.copyOf(hierarchy.values());
+        this.nameToField.putAll(hierarchy);
 
         // Extract table name
         Table tableAnnotation = entityClass.getAnnotation(Table.class);
@@ -70,8 +82,7 @@ public class EntityMetadata {
         boolean foundAutoIncrement = false;
         Field foundVersionField = null;
 
-        for (Field field : entityClass.getDeclaredFields()) {
-            field.setAccessible(true);
+        for (Field field : hierarchyFields) {
             validateRelationshipField(field);
 
             if (field.isAnnotationPresent(de.t14d3.spool.annotations.Version.class)) {
@@ -237,7 +248,7 @@ public class EntityMetadata {
                         + "is not supported. Add the owning @ManyToOne field on "
                         + oneToMany.targetEntity().getSimpleName() + " and set mappedBy to its name.");
             }
-            Field inverse = declaredField(oneToMany.targetEntity(), mappedBy);
+            Field inverse = findField(oneToMany.targetEntity(), mappedBy);
             if (inverse == null) {
                 throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToMany field '"
                         + field.getName() + "' declares mappedBy='" + mappedBy + "' but "
@@ -266,7 +277,7 @@ public class EntityMetadata {
             }
             String mappedBy = manyToMany.mappedBy();
             if (mappedBy != null && !mappedBy.isBlank()) {
-                Field inverse = declaredField(target, mappedBy);
+                Field inverse = findField(target, mappedBy);
                 if (inverse == null) {
                     throw new IllegalArgumentException("Entity " + declaring.getName() + " @ManyToMany field '"
                             + field.getName() + "' declares mappedBy='" + mappedBy + "' but "
@@ -312,12 +323,66 @@ public class EntityMetadata {
         return Object.class;
     }
 
-    private static Field declaredField(Class<?> type, String name) {
-        try {
-            return type.getDeclaredField(name);
-        } catch (NoSuchFieldException e) {
-            return null;
+    /**
+     * Finds a declared field by name on {@code type} or any of its
+     * superclasses (base-first lookup, subclass declarations shadow
+     * superclass ones for the same name). Returns null when not found.
+     */
+    public static Field findField(Class<?> type, String name) {
+        for (Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                Field field = c.getDeclaredField(name);
+                field.setAccessible(true);
+                return field;
+            } catch (NoSuchFieldException ignored) {
+                // continue up the hierarchy
+            }
         }
+        return null;
+    }
+
+    /**
+     * Builds the mapping class chain: the entity plus its
+     * {@code @MappedSuperclass} ancestors, base-first. Superclasses that are
+     * neither mapped nor field-less are rejected so their fields cannot be
+     * dropped silently.
+     */
+    private static List<Class<?>> collectMappedClasses(Class<?> entityClass) {
+        List<Class<?>> chain = new ArrayList<>();
+        for (Class<?> c = entityClass; c != null && c != Object.class; c = c.getSuperclass()) {
+            chain.add(c);
+        }
+        Collections.reverse(chain); // base-first
+
+        List<Class<?>> mapped = new ArrayList<>(chain.size());
+        for (Class<?> c : chain) {
+            if (c == entityClass || c.isAnnotationPresent(MappedSuperclass.class)) {
+                mapped.add(c);
+                continue;
+            }
+            if (c.isAnnotationPresent(Entity.class)) {
+                throw new IllegalArgumentException("Entity " + entityClass.getName() + " extends entity "
+                        + c.getName() + "; entity inheritance is not supported. Share fields through "
+                        + "@MappedSuperclass instead.");
+            }
+            Field offending = firstPersistentField(c);
+            if (offending != null) {
+                throw new IllegalArgumentException("Entity " + entityClass.getName() + " extends " + c.getName()
+                        + ", which is neither @Entity nor @MappedSuperclass; its field '" + offending.getName()
+                        + "' would be ignored. Annotate the superclass with @MappedSuperclass.");
+            }
+        }
+        return List.copyOf(mapped);
+    }
+
+    private static Field firstPersistentField(Class<?> type) {
+        for (Field field : type.getDeclaredFields()) {
+            if (Modifier.isStatic(field.getModifiers()) || field.isSynthetic()) {
+                continue;
+            }
+            return field;
+        }
+        return null;
     }
 
     /**
@@ -426,6 +491,17 @@ public class EntityMetadata {
         return Collections.unmodifiableList(fields);
     }
 
+    /**
+     * All instance fields declared on the entity or any of its
+     * {@code @MappedSuperclass} ancestors, base-first. Subclass declarations
+     * shadow superclass fields with the same name. This is the field set used
+     * for relationship scanning; {@link #getFields()} is the subset that maps
+     * to direct table columns.
+     */
+    public List<Field> getHierarchyFields() {
+        return hierarchyFields;
+    }
+
     public String getColumnName(Field field) {
         return fieldToColumn.get(field);
     }
@@ -435,7 +511,8 @@ public class EntityMetadata {
     }
 
     /**
-     * Get a declared field by its Java name (not column name). Returns null
+     * Get a declared field by its Java name (not column name), searching the
+     * entity class and its {@code @MappedSuperclass} ancestors. Returns null
      * when no such field exists.
      */
     public Field getFieldByName(String fieldName) {

@@ -620,7 +620,7 @@ public class SchemaIntrospector {
         EntityMetadata ownerMetadata = EntityMetadata.of(entityClass);
         List<TableDefinition> joinTables = new ArrayList<>();
 
-        for (Field field : entityClass.getDeclaredFields()) {
+        for (Field field : ownerMetadata.getHierarchyFields()) {
             if (!field.isAnnotationPresent(ManyToMany.class)) {
                 continue;
             }
@@ -630,7 +630,7 @@ public class SchemaIntrospector {
                 continue;
             }
 
-            Class<?> targetEntity = resolveCollectionElementType(field);
+            Class<?> targetEntity = EntityMetadata.collectionElementType(field);
             if (targetEntity == Object.class) {
                 continue;
             }
@@ -708,26 +708,6 @@ public class SchemaIntrospector {
 
         return joinTables;
     }
-
-    private static Class<?> resolveCollectionElementType(Field field) {
-        Type t = field.getGenericType();
-        if (!(t instanceof ParameterizedType pt)) {
-            return Object.class;
-        }
-        Type[] args = pt.getActualTypeArguments();
-        if (args.length != 1) {
-            return Object.class;
-        }
-        Type arg = args[0];
-        if (arg instanceof Class<?> c) {
-            return c;
-        }
-        if (arg instanceof ParameterizedType apt && apt.getRawType() instanceof Class<?> c) {
-            return c;
-        }
-        return Object.class;
-    }
-
 
     // -----------------------
     // Type mapping helpers
