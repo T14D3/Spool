@@ -13,11 +13,17 @@ public class Query {
     private final Dialect dialect;
     private final StringBuilder sql;
     private final List<Object> parameters;
+    private final int fetchDepth;
 
     private Query(Dialect dialect, StringBuilder sql, List<Object> parameters) {
+        this(dialect, sql, parameters, -1);
+    }
+
+    private Query(Dialect dialect, StringBuilder sql, List<Object> parameters, int fetchDepth) {
         this.dialect = dialect;
         this.sql = sql;
         this.parameters = new ArrayList<>(parameters);
+        this.fetchDepth = fetchDepth;
     }
 
     /**
@@ -39,6 +45,15 @@ public class Query {
      */
     public Dialect getDialect() {
         return dialect;
+    }
+
+    /**
+     * Maximum number of eager-fetch levels applied to the result rows, or
+     * {@code -1} for unlimited (the default). Level 1 resolves the direct
+     * eager references of the rows, level 2 their references, and so on.
+     */
+    public int getFetchDepth() {
+        return fetchDepth;
     }
 
     /**
@@ -92,6 +107,7 @@ public class Query {
         private String limit;
         private String offset;
         private String lockClause;
+        private int fetchDepth = -1;
 
         /**
          * A portable "no upper bound" limit for offset-only pagination.
@@ -173,9 +189,21 @@ public class Query {
             return this;
         }
 
+        /**
+         * Bound the number of eager-fetch levels applied to the result rows.
+         * 1 resolves only the direct eager references, 2 their references, and
+         * so on. Values below 1 are rejected.
+         */
+        public SelectBuilder fetchDepth(int depth) {
+            if (depth < 1) {
+                throw new IllegalArgumentException("fetchDepth must be >= 1");
+            }
+            this.fetchDepth = depth;
+            return this;
+        }
+
         public Query build() {
-            if (columns.isEmpty()) {
-                throw new IllegalStateException("SELECT query must specify columns");
+            if (columns.isEmpty()) {                throw new IllegalStateException("SELECT query must specify columns");
             }
             if (fromTable == null) {
                 throw new IllegalStateException("SELECT query must specify a table");
@@ -220,7 +248,7 @@ public class Query {
                 sql.append(" ").append(lockClause);
             }
 
-            return new Query(dialect, sql, parameters);
+            return new Query(dialect, sql, parameters, fetchDepth);
         }
 
         private String quoteColumn(String col) {

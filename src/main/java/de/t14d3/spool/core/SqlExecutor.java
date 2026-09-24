@@ -92,8 +92,10 @@ public class SqlExecutor {
     }
 
     public long count(String tableName) {
-        String sql = "SELECT COUNT(*) FROM " + dialect.quoteIdentifier(tableName);
-        try (PreparedStatement stmt = connection.prepareStatement(sql);
+        Query q = Query.select(dialect, "COUNT(*)")
+                .from(tableName)
+                .build();
+        try (PreparedStatement stmt = connection.prepareStatement(q.getSql());
              ResultSet rs = stmt.executeQuery()) {
             if (rs.next()) {
                 return rs.getLong(1);

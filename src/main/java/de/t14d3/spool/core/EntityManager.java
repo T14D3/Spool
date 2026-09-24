@@ -457,6 +457,62 @@ public class EntityManager implements AutoCloseable {
     }
 
     /**
+     * Evict an entity from the identity map and drop its dirty-check snapshot.
+     * Unflushed changes to the instance are discarded; call {@link #flush()}
+     * first when they must be written. Dirty relationship flags for the
+     * evicted id are dropped as well.
+     *
+     * @return true when an entry was present
+     */
+    public boolean evict(Class<?> entityClass, Object id) {
+        if (id == null) {
+            return false;
+        }
+        EntityMetadata metadata = EntityMetadata.of(entityClass);
+        EntityId entityId = metadata.getEntityIdFrom(id);
+        if (!entityId.isComplete()) {
+            return false;
+        }
+        return evictKey(entityClass, entityId);
+    }
+
+    /**
+     * Evict an entity instance from the identity map. See
+     * {@link #evict(Class, Object)}.
+     */
+    public boolean evict(Object entity) {
+        if (entity == null) {
+            return false;
+        }
+        EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+        EntityId id = metadata.getEntityId(entity);
+        if (!id.isComplete()) {
+            return false;
+        }
+        return evictKey(entity.getClass(), id);
+    }
+
+    private boolean evictKey(Class<?> entityClass, EntityId id) {
+        EntityKey key = new EntityKey(entityClass, id);
+        Object removed = identityMap.remove(key);
+        originalValues.remove(key);
+        if (removed != null) {
+            dirtyManyToMany.removeIf(dirty -> dirty.entityClass().equals(entityClass) && dirty.id().equals(id));
+            dirtyOneToMany.removeIf(dirty -> dirty.entityClass().equals(entityClass) && dirty.id().equals(id));
+        }
+        return removed != null;
+    }
+
+    /**
+     * Number of entities currently held in the identity map. Diagnostic API:
+     * use it to watch memory growth during bulk imports and to verify that
+     * periodic {@link #evict(Object)} / {@link #clear()} keeps the map flat.
+     */
+    public int managedEntityCount() {
+        return identityMap.size();
+    }
+
+    /**
      * Find an entity by its ID.
      * <p>
      * Thread-safe: identity map and L2 cache lookups are lock-free.
@@ -1074,11 +1130,11 @@ public class EntityManager implements AutoCloseable {
         EntityMetadata metadata = EntityMetadata.of(entityClass);
         synchronized (connection) {
             List<T> rows = executor.findAll(entityClass);
-            prefetchEagerSingleRefs(rows);
+            prefetchEagerSingleRefs(rows, -1);
             boolean ownsBatch = beginEagerCollectionBatch();
             try {
                 if (ownsBatch) {
-                    relationshipManager.prefetchEagerCollections(rows);
+                    relationshipManager.prefetchEagerCollections(rows, -1);
                 }
                 List<T> managed = new ArrayList<>(rows.size());
                 for (T row : rows) {
@@ -1097,7 +1153,7 @@ public class EntityManager implements AutoCloseable {
      * Execute a SELECT query and attach results to this EntityManager.
      */
     public <T> List<T> executeSelectQuery(Query query, Class<T> entityClass) {
-        return executeSelectQuery(query.getSql(), query.getParameters(), entityClass);
+        return executeSelectQuery(query.getSql(), query.getParameters(), entityClass, query.getFetchDepth());
     }
 
     /**
@@ -1128,6 +1184,15 @@ public class EntityManager implements AutoCloseable {
      * to this EntityManager.
      */
     public <T> List<T> executeSelectQuery(String sql, List<Object> parameters, Class<T> entityClass) {
+        return executeSelectQuery(sql, parameters, entityClass, -1);
+    }
+
+    /**
+     * Execute a SELECT statement with explicit parameters and attach results
+     * to this EntityManager, bounding eager-fetch recursion to
+     * {@code fetchDepth} levels ({@code -1} for unlimited).
+     */
+    public <T> List<T> executeSelectQuery(String sql, List<Object> parameters, Class<T> entityClass, int fetchDepth) {
         EntityMetadata metadata = EntityMetadata.of(entityClass);
         synchronized (connection) {
             List<T> rows = new ArrayList<>();
@@ -1144,11 +1209,11 @@ public class EntityManager implements AutoCloseable {
 
             // Resolve eager single references in batches so loading N rows
             // does not issue N lookups per relation.
-            prefetchEagerSingleRefs(rows);
+            prefetchEagerSingleRefs(rows, fetchDepth);
             boolean ownsBatch = beginEagerCollectionBatch();
             try {
                 if (ownsBatch) {
-                    relationshipManager.prefetchEagerCollections(rows);
+                    relationshipManager.prefetchEagerCollections(rows, fetchDepth);
                 }
                 List<T> results = new ArrayList<>(rows.size());
                 for (T row : rows) {
@@ -1693,17 +1758,21 @@ public class EntityManager implements AutoCloseable {
      * Load the targets of eager {@code @ManyToOne}/{@code @OneToOne}
      * relations referenced by {@code roots} in one query per target class per
      * level, instead of one query per row. Loaded targets are managed and
-     * their own eager references are prefetched recursively; the subsequent
-     * per-entity hydration then finds them in the identity map.
+     * their own eager references are prefetched up to {@code maxDepth} levels
+     * ({@code -1} for unlimited); the subsequent per-entity hydration then
+     * finds them in the identity map.
      */
-    private void prefetchEagerSingleRefs(List<?> roots) {
+    private void prefetchEagerSingleRefs(List<?> roots, int maxDepth) {
         if (roots == null || roots.isEmpty()) {
             return;
         }
         Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
         Deque<Object> queue = new ArrayDeque<>(roots);
+        List<Object> prefetched = new ArrayList<>();
+        int level = 0;
 
-        while (!queue.isEmpty()) {
+        while (!queue.isEmpty() && (maxDepth < 0 || level < maxDepth)) {
+            level++;
             Map<Class<?>, Set<Object>> missingByClass = new LinkedHashMap<>();
 
             while (!queue.isEmpty()) {
@@ -1754,12 +1823,53 @@ public class EntityManager implements AutoCloseable {
                         EntityMetadata metadata = EntityMetadata.of(row.getClass());
                         Object managed = managePrefetched(row, metadata);
                         if (managed == row) {
+                            prefetched.add(row);
                             loadedThisWave.add(row);
                         }
                     }
                 }
             }
+            // A target loaded in this wave may be referenced by any entity
+            // prefetched earlier; link from the identity map only (no SQL).
+            for (Object entity : prefetched) {
+                linkPrefetchedSingleRefs(entity, EntityMetadata.of(entity.getClass()));
+            }
             queue.addAll(loadedThisWave);
+        }
+    }
+
+    /**
+     * Fill the EAGER single-reference fields of a prefetched row from the
+     * identity map only; a target that has not been prefetched yet stays an
+     * id-only stub so depth limits are not bypassed by extra queries.
+     */
+    private void linkPrefetchedSingleRefs(Object entity, EntityMetadata metadata) {
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (relationship.relationshipType()
+                    != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_ONE
+                    && relationship.relationshipType()
+                    != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_ONE) {
+                continue;
+            }
+            if (relationship.fetch() != de.t14d3.spool.annotations.FetchType.EAGER) {
+                continue;
+            }
+            Object related = metadata.getFieldValue(entity, relationship.field());
+            if (related == null) {
+                continue;
+            }
+            EntityMetadata relatedMeta = EntityMetadata.of(related.getClass());
+            if (relatedMeta.isCompositeId()) {
+                continue;
+            }
+            EntityId relatedId = relatedMeta.getEntityId(related);
+            if (!relatedId.isComplete()) {
+                continue;
+            }
+            Object managed = identityMap.get(new EntityKey(related.getClass(), relatedId));
+            if (managed != null) {
+                metadata.setFieldValue(entity, relationship.field(), managed);
+            }
         }
     }
 
@@ -1768,8 +1878,7 @@ public class EntityManager implements AutoCloseable {
      * eager relations; those are resolved by the prefetch queue itself.
      */
     @SuppressWarnings("unchecked")
-    private <T> T managePrefetched(T entity, EntityMetadata metadata) {
-        EntityId id = metadata.getEntityId(entity);
+    private <T> T managePrefetched(T entity, EntityMetadata metadata) {        EntityId id = metadata.getEntityId(entity);
         if (!id.isComplete()) {
             return entity;
         }
@@ -1972,11 +2081,12 @@ public class EntityManager implements AutoCloseable {
     private record OneToManyDirtyKey(Class<?> entityClass, EntityId id, String fieldName) {}
 
     Set<Object> loadManyToManyOtherIds(ManyToManyJoinTable join, Object thisId, Class<?> otherIdType) {
-        String sql = "SELECT " + dialect.quoteIdentifier(join.otherColumn()) +
-                " FROM " + dialect.quoteIdentifier(join.joinTable()) +
-                " WHERE " + dialect.quoteIdentifier(join.thisColumn()) + " = ?";
-        try (PreparedStatement ps = executor.getConnection().prepareStatement(sql)) {
-            ps.setObject(1, thisId);
+        Query q = Query.select(dialect, join.otherColumn())
+                .from(join.joinTable())
+                .where(dialect.quoteIdentifier(join.thisColumn()) + " = ?", thisId)
+                .build();
+        try (PreparedStatement ps = executor.getConnection().prepareStatement(q.getSql())) {
+            SqlExecutor.setParameters(ps, q.getParameters());
             Set<Object> ids = new LinkedHashSet<>();
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {

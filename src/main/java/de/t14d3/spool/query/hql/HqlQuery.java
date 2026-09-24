@@ -47,6 +47,7 @@ public final class HqlQuery {
     private final List<ParamRef> paramRefs;
     private final List<FetchPath> fetchPaths;
     private final boolean countQuery;
+    private int fetchDepth = -1;
     private final Map<String, Object> namedParameters = new HashMap<>();
     private final Map<Integer, Object> positionalParameters = new HashMap<>();
 
@@ -120,6 +121,21 @@ public final class HqlQuery {
     }
 
     /**
+     * Bound eager-fetch recursion for this query: 1 resolves only the direct
+     * eager references of the result rows, 2 their references, and so on.
+     * Defaults to unlimited. LAZY associations are unaffected; use
+     * {@code JOIN FETCH} or {@code em.initialize} to resolve them.
+     */
+    public HqlQuery setFetchDepth(int fetchDepth) {
+        if (fetchDepth < 1) {
+            throw new IllegalArgumentException("fetchDepth must be >= 1");
+        }
+        builder.fetchDepth(fetchDepth);
+        this.fetchDepth = fetchDepth;
+        return this;
+    }
+
+    /**
      * Skip the first {@code firstResult} rows (0-based). Can be combined with
      * {@link #setMaxResults(int)} for pagination.
      */
@@ -148,7 +164,7 @@ public final class HqlQuery {
             long count = entityManager.executeCountQuery(sql, parameters);
             return (List<T>) List.of(count);
         }
-        List<T> results = (List<T>) entityManager.executeSelectQuery(sql, parameters, resultClass);
+        List<T> results = (List<T>) entityManager.executeSelectQuery(sql, parameters, resultClass, fetchDepth);
         if (!fetchPaths.isEmpty()) {
             entityManager.applyFetchPaths((List<Object>) (List<?>) results, fetchPaths);
         }

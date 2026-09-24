@@ -882,7 +882,7 @@ public class RelationshipManager {
      * hydration pass skips them; children join the next wave so their own
      * EAGER collections are batched too.
      */
-    public void prefetchEagerCollections(List<?> rows) {
+    public void prefetchEagerCollections(List<?> rows, int maxDepth) {
         if (rows == null || rows.isEmpty()) {
             return;
         }
@@ -893,8 +893,10 @@ public class RelationshipManager {
                 wave.add(row);
             }
         }
+        int level = 0;
 
-        while (!wave.isEmpty()) {
+        while (!wave.isEmpty() && (maxDepth < 0 || level < maxDepth)) {
+            level++;
             Map<Class<?>, List<Object>> byClass = new LinkedHashMap<>();
             while (!wave.isEmpty()) {
                 Object entity = wave.poll();
