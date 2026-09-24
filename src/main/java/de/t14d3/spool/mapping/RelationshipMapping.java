@@ -51,6 +51,21 @@ public record RelationshipMapping(Field field, Class<?> targetEntity, Relationsh
         return mappedBy == null || mappedBy.isBlank();
     }
 
+    /**
+     * True when removing a child from this association deletes its row at
+     * flush time ({@code orphanRemoval = true}).
+     */
+    public boolean isOrphanRemoval() {
+        de.t14d3.spool.annotations.OneToMany oneToMany =
+                field.getAnnotation(de.t14d3.spool.annotations.OneToMany.class);
+        if (oneToMany != null) {
+            return oneToMany.orphanRemoval();
+        }
+        de.t14d3.spool.annotations.OneToOne oneToOne =
+                field.getAnnotation(de.t14d3.spool.annotations.OneToOne.class);
+        return oneToOne != null && oneToOne.orphanRemoval();
+    }
+
     public enum RelationshipType {
         ONE_TO_ONE, MANY_TO_ONE, ONE_TO_MANY, MANY_TO_MANY
     }

@@ -19,7 +19,7 @@ public class Passport {
     private String number;
 
     /** Owning side: this table carries the FK column. */
-    @OneToOne(cascade = CascadeType.ALL)
+    @OneToOne(cascade = CascadeType.ALL, orphanRemoval = true)
     @JoinColumn(name = "person_id")
     private Person person;
 

@@ -1002,7 +1002,8 @@ public class RelationshipManager {
     }
 
     private Runnable mutationTracker(Object entity, RelationshipMapping relationship) {
-        return relationship.isOwningSide()
+        boolean needsTracking = relationship.isOwningSide() || relationship.isOrphanRemoval();
+        return needsTracking
                 ? () -> entityManager.markOneToManyDirty(entity, relationship.field())
                 : null;
     }

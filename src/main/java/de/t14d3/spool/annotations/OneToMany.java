@@ -35,4 +35,12 @@ public @interface OneToMany {
      * Cascade operations to related entities.
      */
     CascadeType[] cascade() default {};
+
+    /**
+     * When true, removing a child from this collection deletes its row at
+     * flush time. When false (default), the child row is left untouched; for a
+     * unidirectional {@code @OneToMany} the managed FK column is nulled
+     * instead.
+     */
+    boolean orphanRemoval() default false;
 }

@@ -606,6 +606,7 @@ public class EntityManager implements AutoCloseable {
 
                     EntityMetadata meta = EntityMetadata.of(entity.getClass());
                     deleteManyToManyJoinRows(entity, meta);
+                    deleteOrphansForRemovedOwner(entity, meta);
                     unlinkForeignKeyOneToMany(entity, meta);
                     relationshipManager.cascadeRemove(entity, meta);
 
@@ -686,6 +687,7 @@ public class EntityManager implements AutoCloseable {
                         callbacks.invoke(EntityCallbacks.Phase.PRE_UPDATE, entity);
                         executor.update(entity, meta, snapshot);
                         callbacks.invoke(EntityCallbacks.Phase.POST_UPDATE, entity);
+                        handleOrphanRemovalsOnUpdate(entity, meta, snapshot);
                     }
                     if (id.isComplete()) {
                         EntityKey entityKey = new EntityKey(entity.getClass(), id);
@@ -728,6 +730,12 @@ public class EntityManager implements AutoCloseable {
                         continue;
                     }
                     syncForeignKeyOneToMany(entity, EntityMetadata.of(entity.getClass()));
+                }
+                for (Object entity : syncCandidates) {
+                    if (entity == null || deleteSet.contains(entity)) {
+                        continue;
+                    }
+                    processOrphanRemovals(entity, EntityMetadata.of(entity.getClass()));
                 }
 
                 publishCacheEvents(cacheEvents);
@@ -2245,8 +2253,12 @@ public class EntityManager implements AutoCloseable {
         toRemove.removeAll(desired);
 
         for (Object childId : toRemove) {
-            Query q = updateChildForeignKey(childMeta, fkColumn, null, childId);
-            executor.executeUpdate(q.getSql(), q.getParameters());
+            if (relationship.isOrphanRemoval()) {
+                deleteChildRow(childMeta, childId);
+            } else {
+                Query q = updateChildForeignKey(childMeta, fkColumn, null, childId);
+                executor.executeUpdate(q.getSql(), q.getParameters());
+            }
         }
         for (Object childId : toAdd) {
             Query q = updateChildForeignKey(childMeta, fkColumn, ownerId, childId);
@@ -2329,6 +2341,156 @@ public class EntityManager implements AutoCloseable {
             }
             syncForeignKeyOneToManyAssociation(entity, metadata, relationship, entityId.singleValue());
             clearOneToManyDirty(metadata.getEntityClass(), entityId, relationship.field());
+        }
+    }
+
+    private void deleteChildRow(EntityMetadata childMeta, Object childId) {
+        if (childMeta.isCompositeId()) {
+            throw new UnsupportedOperationException(
+                    "orphanRemoval with a composite-id child is not supported: "
+                            + childMeta.getEntityClass().getName());
+        }
+        Query q = Query.deleteFrom(dialect, childMeta.getTableName())
+                .where(dialect.quoteIdentifier(childMeta.getIdColumnName()) + " = ?", childId)
+                .build();
+        executor.executeUpdate(q.getSql(), q.getParameters());
+    }
+
+    /**
+     * Deletes rows of children that were removed from a mappedBy
+     * {@code @OneToMany} with {@code orphanRemoval = true}. Unidirectional
+     * associations are handled by the FK sync pass (delete instead of null).
+     */
+    private void processOrphanRemovals(Object entity, EntityMetadata metadata) {
+        if (entity == null) {
+            return;
+        }
+        EntityId entityId = metadata.getEntityId(entity);
+        if (!entityId.isComplete()) {
+            return;
+        }
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_MANY
+                    || relationship.isOwningSide()
+                    || !relationship.isOrphanRemoval()) {
+                continue;
+            }
+            Object value = metadata.getFieldValue(entity, relationship.field());
+            if (!isOneToManyDirty(metadata.getEntityClass(), entityId, relationship.field())
+                    && RelationshipManager.isMutationTracked(value)) {
+                continue;
+            }
+            if (metadata.isCompositeId()) {
+                throw new UnsupportedOperationException(
+                        "orphanRemoval with a composite-id owner is not supported: "
+                                + metadata.getEntityClass().getName());
+            }
+            EntityMetadata childMeta = EntityMetadata.of(relationship.targetEntity());
+            Field mappedByField = EntityMetadata.findField(relationship.targetEntity(), relationship.mappedBy());
+            String fkColumn = mappedByField == null ? null : childMeta.getColumnName(mappedByField);
+            if (fkColumn == null || fkColumn.isBlank()) {
+                throw new IllegalStateException("orphanRemoval mappedBy field is not column-mapped: "
+                        + relationship.targetEntity().getName() + "." + relationship.mappedBy());
+            }
+            Set<Object> existing = loadForeignKeyChildIds(childMeta, fkColumn, entityId.singleValue());
+            Set<Object> desired = relationshipIds(value, relationship);
+            Set<Object> orphans = new LinkedHashSet<>(existing);
+            orphans.removeAll(desired);
+            for (Object childId : orphans) {
+                deleteChildRow(childMeta, childId);
+            }
+            clearOneToManyDirty(metadata.getEntityClass(), entityId, relationship.field());
+        }
+    }
+
+    private Set<Object> relationshipIds(Object value, de.t14d3.spool.mapping.RelationshipMapping relationship) {
+        Set<Object> ids = new LinkedHashSet<>();
+        if (value instanceof Collection<?> collection) {
+            for (Object child : collection) {
+                if (child == null) {
+                    continue;
+                }
+                EntityMetadata childInstanceMeta = EntityMetadata.of(child.getClass());
+                if (childInstanceMeta.isCompositeId()) {
+                    throw new UnsupportedOperationException(
+                            "Relationship child with a composite id is not supported: " + child.getClass().getName());
+                }
+                EntityId childId = childInstanceMeta.getEntityId(child);
+                if (!childId.isComplete()) {
+                    throw new IllegalStateException("Relationship child has no id at flush: "
+                            + child.getClass().getName() + " (persist it or cascade from "
+                            + relationship.field().getDeclaringClass().getName() + "." + relationship.field().getName() + ")");
+                }
+                ids.add(childId.singleValue());
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * Owning-side {@code @OneToOne} with {@code orphanRemoval}: when the FK
+     * moved to another row (or to null), delete the previously referenced row.
+     */
+    private void handleOrphanRemovalsOnUpdate(Object entity, EntityMetadata metadata, Map<Field, Object> snapshot) {
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (relationship.relationshipType() != de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_ONE
+                    || !relationship.isOwningSide()
+                    || !relationship.isOrphanRemoval()) {
+                continue;
+            }
+            Object oldId = snapshot == null ? null : snapshot.get(relationship.field());
+            Object currentId = SqlExecutor.comparableFieldValue(metadata, relationship.field(), entity);
+            if (oldId == null || oldId.equals(currentId)) {
+                continue;
+            }
+            EntityMetadata targetMeta = EntityMetadata.of(relationship.targetEntity());
+            deleteChildRow(targetMeta, oldId);
+        }
+    }
+
+    /**
+     * Deletes children (or the referenced owner for an owning OneToOne) of an
+     * entity being removed when orphanRemoval is enabled, regardless of
+     * cascade settings.
+     */
+    private void deleteOrphansForRemovedOwner(Object entity, EntityMetadata metadata) {
+        EntityId entityId = metadata.getEntityId(entity);
+        if (!entityId.isComplete() || metadata.isCompositeId()) {
+            return;
+        }
+        for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+            if (!relationship.isOrphanRemoval()) {
+                continue;
+            }
+            if (relationship.relationshipType() == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_MANY) {
+                EntityMetadata childMeta = EntityMetadata.of(relationship.targetEntity());
+                String fkColumn;
+                if (relationship.isOwningSide()) {
+                    fkColumn = relationship.joinColumn();
+                } else {
+                    Field mappedByField = EntityMetadata.findField(relationship.targetEntity(), relationship.mappedBy());
+                    fkColumn = mappedByField == null ? null : childMeta.getColumnName(mappedByField);
+                }
+                if (fkColumn == null || fkColumn.isBlank()) {
+                    continue;
+                }
+                Query q = Query.deleteFrom(dialect, childMeta.getTableName())
+                        .where(dialect.quoteIdentifier(fkColumn) + " = ?", entityId.singleValue())
+                        .build();
+                executor.executeUpdate(q.getSql(), q.getParameters());
+            } else if (relationship.relationshipType()
+                    == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_ONE
+                    && relationship.isOwningSide()) {
+                Object value = metadata.getFieldValue(entity, relationship.field());
+                if (value == null) {
+                    continue;
+                }
+                EntityMetadata targetMeta = EntityMetadata.of(relationship.targetEntity());
+                EntityId relatedId = targetMeta.getEntityId(value);
+                if (relatedId.isComplete()) {
+                    deleteChildRow(targetMeta, relatedId.singleValue());
+                }
+            }
         }
     }
 

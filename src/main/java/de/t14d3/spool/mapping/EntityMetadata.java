@@ -329,6 +329,10 @@ public class EntityMetadata {
                             + field.getType().getName() + "." + oneToOne.mappedBy()
                             + " is itself an inverse side (its mappedBy is set); mappedBy must point at the owning side");
                 }
+                if (oneToOne.orphanRemoval()) {
+                    throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToOne field '"
+                            + field.getName() + "' is the inverse side; orphanRemoval is only supported on the owning side");
+                }
             }
             return;
         }

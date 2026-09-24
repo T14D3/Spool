@@ -30,4 +30,11 @@ public @interface OneToOne {
      * The field in the target entity that references this entity (for bidirectional).
      */
     String mappedBy() default "";
+
+    /**
+     * When true, replacing or clearing this owning-side reference deletes the
+     * previously referenced row at flush time. Only supported on the owning
+     * side (blank {@code mappedBy}).
+     */
+    boolean orphanRemoval() default false;
 }
