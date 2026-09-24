@@ -107,6 +107,7 @@ public class Query {
         private String limit;
         private String offset;
         private String lockClause;
+        private String groupBy;
         private int fetchDepth = -1;
 
         /**
@@ -164,6 +165,15 @@ public class Query {
 
         public SelectBuilder orderBy(String orderBy) {
             this.orderBy = orderBy;
+            return this;
+        }
+
+        /**
+         * Append a {@code GROUP BY} clause. The caller is responsible for
+         * quoting the expressions.
+         */
+        public SelectBuilder groupBy(String groupBy) {
+            this.groupBy = groupBy;
             return this;
         }
 
@@ -227,6 +237,10 @@ public class Query {
 
             if (!whereClause.isEmpty()) {
                 sql.append(" WHERE ").append(whereClause);
+            }
+
+            if (groupBy != null && !groupBy.trim().isEmpty()) {
+                sql.append(" GROUP BY ").append(groupBy);
             }
 
             if (orderBy != null && !orderBy.trim().isEmpty()) {

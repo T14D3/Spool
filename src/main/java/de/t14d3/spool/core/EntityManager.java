@@ -1157,6 +1157,38 @@ public class EntityManager implements AutoCloseable {
     }
 
     /**
+     * Execute a scalar projection / aggregate query. A single selected column
+     * yields the raw JDBC value per row; multiple columns yield {@code Object[]}
+     * tuples.
+     */
+    public List<Object> executeProjectionQuery(String sql, List<Object> parameters) {
+        synchronized (connection) {
+            List<Object> rows = new ArrayList<>();
+            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                SqlExecutor.setParameters(stmt, parameters);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    int columns = rs.getMetaData().getColumnCount();
+                    while (rs.next()) {
+                        if (columns == 1) {
+                            rows.add(rs.getObject(1));
+                        } else {
+                            Object[] tuple = new Object[columns];
+                            for (int i = 0; i < columns; i++) {
+                                tuple[i] = rs.getObject(i + 1);
+                            }
+                            rows.add(tuple);
+                        }
+                    }
+                }
+            } catch (SQLException e) {
+                throw new RuntimeException(
+                        "Failed to execute projection query: " + sql + " params=" + parameters, e);
+            }
+            return rows;
+        }
+    }
+
+    /**
      * Execute a scalar COUNT-style query and return its single numeric result.
      */
     public long executeCountQuery(String sql, List<Object> parameters) {

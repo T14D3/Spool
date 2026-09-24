@@ -15,7 +15,7 @@ import java.util.Map;
 final class HqlLexer {
 
     enum Kind {
-        SELECT, FROM, WHERE, ORDER, BY, ASC, DESC, LIMIT,
+        SELECT, FROM, WHERE, ORDER, BY, ASC, DESC, LIMIT, GROUP,
         JOIN, FETCH, LEFT, INNER,
         AND, OR, NOT, IN, IS, NULL, LIKE, TRUE, FALSE,
         IDENT, NUMBER, STRING, NAMED_PARAM, POSITIONAL_PARAM,
@@ -36,6 +36,7 @@ final class HqlLexer {
             Map.entry("ASC", Kind.ASC),
             Map.entry("DESC", Kind.DESC),
             Map.entry("LIMIT", Kind.LIMIT),
+            Map.entry("GROUP", Kind.GROUP),
             Map.entry("JOIN", Kind.JOIN),
             Map.entry("FETCH", Kind.FETCH),
             Map.entry("LEFT", Kind.LEFT),

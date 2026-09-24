@@ -10,6 +10,7 @@ import de.t14d3.spool.query.Query;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -38,7 +39,11 @@ import java.util.Map;
 final class HqlParser {
 
     record Parsed(Class<?> entityClass, Query.SelectBuilder builder, List<HqlQuery.ParamRef> params,
-                  boolean countQuery, List<HqlQuery.FetchPath> fetchPaths) {
+                  boolean countQuery, List<HqlQuery.FetchPath> fetchPaths, boolean projection) {
+    }
+
+    /** A SELECT-list item: a plain field path or an aggregate over one. */
+    private record Projection(String function, String path) {
     }
 
     private final Dialect dialect;
@@ -59,25 +64,14 @@ final class HqlParser {
 
     Parsed parse() {
         expect(HqlLexer.Kind.SELECT);
-        String selectAlias = null;
-        String countAlias = null;
-        boolean countQuery = false;
-        if (!match(HqlLexer.Kind.STAR)) {
-            if (peekKind(0) == HqlLexer.Kind.IDENT
-                    && current().text().equalsIgnoreCase("count")
-                    && peekKind(1) == HqlLexer.Kind.LPAREN) {
-                index++;
-                expect(HqlLexer.Kind.LPAREN);
-                if (!match(HqlLexer.Kind.STAR)) {
-                    countAlias = expect(HqlLexer.Kind.IDENT).text();
-                }
-                expect(HqlLexer.Kind.RPAREN);
-                countQuery = true;
-            } else {
-                selectAlias = expect(HqlLexer.Kind.IDENT).text();
-                if (peekKind(0) == HqlLexer.Kind.DOT) {
-                    throw new HqlException("Projections are not supported; select the entity alias instead");
-                }
+        boolean entitySelect = false;
+        List<Projection> projections = new ArrayList<>();
+        if (match(HqlLexer.Kind.STAR)) {
+            entitySelect = true;
+        } else {
+            projections.add(parseProjectionDescriptor());
+            while (match(HqlLexer.Kind.COMMA)) {
+                projections.add(parseProjectionDescriptor());
             }
         }
         expect(HqlLexer.Kind.FROM);
@@ -89,17 +83,35 @@ final class HqlParser {
         }
         baseMetadata = EntityMetadata.of(entityClass);
         baseAlias = expect(HqlLexer.Kind.IDENT).text();
-        if (selectAlias != null && !selectAlias.equals(baseAlias)) {
-            throw new HqlException(
-                    "SELECT alias '" + selectAlias + "' does not match FROM alias '" + baseAlias + "'");
+
+        // A single bare alias selects the entity itself: SELECT u FROM User u.
+        if (!entitySelect && projections.size() == 1
+                && projections.get(0).function() == null
+                && projections.get(0).path().equals(baseAlias)) {
+            entitySelect = true;
+            projections.clear();
         }
-        if (countAlias != null && !countAlias.equals(baseAlias)) {
-            throw new HqlException(
-                    "COUNT alias '" + countAlias + "' does not match FROM alias '" + baseAlias + "'");
+        if (!entitySelect && projections.size() == 1
+                && projections.get(0).function() == null
+                && !projections.get(0).path().contains(".")) {
+            throw new HqlException("Unknown entity alias '" + projections.get(0).path()
+                    + "'; expected '" + baseAlias + "'");
         }
 
-        builder = Query.select(dialect, countQuery ? "COUNT(*)" : "*")
-                .from(baseMetadata.getTableName(), baseAlias);
+        boolean countQuery = !entitySelect && projections.size() == 1
+                && "COUNT".equals(projections.get(0).function())
+                && ("*".equals(projections.get(0).path()) || projections.get(0).path().equals(baseAlias));
+
+        builder = Query.select(dialect).from(baseMetadata.getTableName(), baseAlias);
+        if (entitySelect) {
+            builder.select("*");
+        } else {
+            List<String> columns = new ArrayList<>(projections.size());
+            for (Projection projection : projections) {
+                columns.add(resolveProjection(projection));
+            }
+            builder.select(columns.toArray(new String[0]));
+        }
 
         List<HqlQuery.FetchPath> fetchPaths = new ArrayList<>();
         while (peekKind(0) == HqlLexer.Kind.JOIN
@@ -136,6 +148,10 @@ final class HqlParser {
         if (match(HqlLexer.Kind.WHERE)) {
             builder.where(parseOr());
         }
+        if (match(HqlLexer.Kind.GROUP)) {
+            expect(HqlLexer.Kind.BY);
+            builder.groupBy(parseGroupBy());
+        }
         if (countQuery) {
             if (peekKind(0) == HqlLexer.Kind.ORDER || peekKind(0) == HqlLexer.Kind.LIMIT) {
                 throw new HqlException("ORDER BY and LIMIT are not supported on COUNT queries");
@@ -151,7 +167,71 @@ final class HqlParser {
         }
         expect(HqlLexer.Kind.EOF);
 
-        return new Parsed(entityClass, builder, params, countQuery, fetchPaths);
+        return new Parsed(entityClass, builder, params, countQuery, fetchPaths, !entitySelect);
+    }
+
+    /**
+     * Parses one SELECT-list item: a dotted field path, or an aggregate
+     * function over one ({@code COUNT(*)}, {@code MAX(u.id)}, ...).
+     */
+    private Projection parseProjectionDescriptor() {
+        HqlLexer.Token first = expect(HqlLexer.Kind.IDENT);
+        if (peekKind(0) != HqlLexer.Kind.LPAREN) {
+            StringBuilder path = new StringBuilder(first.text());
+            while (match(HqlLexer.Kind.DOT)) {
+                path.append('.').append(expect(HqlLexer.Kind.IDENT).text());
+            }
+            return new Projection(null, path.toString());
+        }
+
+        String function = first.text().toUpperCase();
+        if (!function.equals("COUNT") && !function.equals("MIN") && !function.equals("MAX")
+                && !function.equals("SUM") && !function.equals("AVG")) {
+            throw new HqlException("Unknown aggregate function '" + first.text() + "'", first.position());
+        }
+        index++; // consume '('
+        String argument;
+        if (peekKind(0) == HqlLexer.Kind.STAR) {
+            index++;
+            argument = "*";
+        } else {
+            StringBuilder path = new StringBuilder(expect(HqlLexer.Kind.IDENT).text());
+            while (match(HqlLexer.Kind.DOT)) {
+                path.append('.').append(expect(HqlLexer.Kind.IDENT).text());
+            }
+            argument = path.toString();
+        }
+        expect(HqlLexer.Kind.RPAREN);
+        return new Projection(function, argument);
+    }
+
+    private String resolveProjection(Projection projection) {
+        if (projection.function() == null) {
+            // Unquoted: SelectBuilder quotes each column of the projection.
+            return resolvePathExpression(projection.path(), false);
+        }
+        boolean star = "*".equals(projection.path()) || projection.path().equals(baseAlias);
+        if (star && !projection.function().equals("COUNT")) {
+            throw new HqlException(projection.function() + "(*) is not supported");
+        }
+        // Aggregates are left as-is by SelectBuilder, so quote explicitly.
+        String expression = star ? "*" : resolvePathExpression(projection.path(), true);
+        return projection.function() + "(" + expression + ")";
+    }
+
+    private String resolvePathExpression(String path, boolean quoted) {
+        if ("*".equals(path)) {
+            return "*";
+        }
+        String[] parts = path.split("\\.");
+        if (!parts[0].equals(baseAlias)) {
+            throw new HqlException("Unknown entity alias '" + parts[0] + "'; expected '" + baseAlias + "'");
+        }
+        if (parts.length < 2) {
+            throw new HqlException("Expected a field path after alias '" + baseAlias + "'");
+        }
+        return resolvePathSegments(baseMetadata, baseAlias,
+                new ArrayList<>(Arrays.asList(parts).subList(1, parts.length)), quoted);
     }
 
     private String parseQualifiedName() {
@@ -307,34 +387,50 @@ final class HqlParser {
             throw new HqlException("Unknown entity alias '" + first.text() + "'", first.position());
         }
 
-        List<HqlLexer.Token> segments = new ArrayList<>();
+        List<String> segments = new ArrayList<>();
         while (match(HqlLexer.Kind.DOT)) {
-            segments.add(expect(HqlLexer.Kind.IDENT));
+            segments.add(expect(HqlLexer.Kind.IDENT).text());
         }
         if (segments.isEmpty()) {
             throw new HqlException(
                     "Expected a field path after alias '" + baseAlias + "'", first.position());
         }
+        return resolvePathSegments(baseMetadata, baseAlias, segments, quoted);
+    }
 
-        EntityMetadata metadata = baseMetadata;
-        String alias = baseAlias;
+    private String parseGroupBy() {
+        StringBuilder group = new StringBuilder();
+        do {
+            if (group.length() > 0) {
+                group.append(", ");
+            }
+            group.append(parsePath(true));
+        } while (match(HqlLexer.Kind.COMMA));
+        return group.toString();
+    }
+
+    /**
+     * Resolves dotted field segments to a quoted/unquoted SQL column
+     * expression, adding implicit joins for traversed single references.
+     */
+    private String resolvePathSegments(
+            EntityMetadata startMetadata, String startAlias, List<String> segments, boolean quoted) {
+        EntityMetadata metadata = startMetadata;
+        String alias = startAlias;
         for (int i = 0; i < segments.size(); i++) {
-            HqlLexer.Token segment = segments.get(i);
-            Field field = metadata.getFieldByName(segment.text());
+            String segment = segments.get(i);
+            Field field = metadata.getFieldByName(segment);
             if (field == null) {
                 throw new HqlException(
-                        "Unknown field '" + segment.text() + "' on "
-                                + metadata.getEntityClass().getSimpleName(),
-                        segment.position());
+                        "Unknown field '" + segment + "' on " + metadata.getEntityClass().getSimpleName());
             }
 
             if (i == segments.size() - 1) {
                 String column = metadata.getColumnName(field);
                 if (column == null) {
                     throw new HqlException(
-                            "Field '" + segment.text() + "' is a relationship; use a nested path such as "
-                                    + segment.text() + ".id",
-                            segment.position());
+                            "Field '" + segment + "' is a relationship; use a nested path such as "
+                                    + segment + ".id");
                 }
                 return quoted
                         ? quote(alias) + "." + quote(column)
@@ -343,12 +439,11 @@ final class HqlParser {
 
             if (!field.isAnnotationPresent(ManyToOne.class) && !field.isAnnotationPresent(OneToOne.class)) {
                 throw new HqlException(
-                        "Cannot traverse '" + segment.text() + "' on "
+                        "Cannot traverse '" + segment + "' on "
                                 + metadata.getEntityClass().getSimpleName()
-                                + ": only @ManyToOne and @OneToOne paths are supported",
-                        segment.position());
+                                + ": only @ManyToOne and @OneToOne paths are supported");
             }
-            alias = joinFor(alias, metadata, field, segment.text());
+            alias = joinFor(alias, metadata, field, segment);
             metadata = EntityMetadata.of(field.getType());
         }
         throw new IllegalStateException("Unreachable: path resolution must return");

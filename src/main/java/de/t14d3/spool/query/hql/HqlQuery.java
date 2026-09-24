@@ -47,24 +47,26 @@ public final class HqlQuery {
     private final List<ParamRef> paramRefs;
     private final List<FetchPath> fetchPaths;
     private final boolean countQuery;
+    private final boolean projection;
     private int fetchDepth = -1;
     private final Map<String, Object> namedParameters = new HashMap<>();
     private final Map<Integer, Object> positionalParameters = new HashMap<>();
 
     HqlQuery(EntityManager entityManager, Class<?> resultClass, Query.SelectBuilder builder,
-             List<ParamRef> paramRefs, boolean countQuery, List<FetchPath> fetchPaths) {
+             List<ParamRef> paramRefs, boolean countQuery, List<FetchPath> fetchPaths, boolean projection) {
         this.entityManager = entityManager;
         this.resultClass = resultClass;
         this.builder = builder;
         this.paramRefs = List.copyOf(paramRefs);
         this.countQuery = countQuery;
         this.fetchPaths = List.copyOf(fetchPaths);
+        this.projection = projection;
     }
 
     public static HqlQuery parse(EntityManager entityManager, String hql) {
         HqlParser.Parsed parsed = new HqlParser(entityManager.getDialect(), hql).parse();
         return new HqlQuery(entityManager, parsed.entityClass(), parsed.builder(), parsed.params(),
-                parsed.countQuery(), parsed.fetchPaths());
+                parsed.countQuery(), parsed.fetchPaths(), parsed.projection());
     }
 
     /**
@@ -160,9 +162,16 @@ public final class HqlQuery {
         Query query = builder.build();
         List<Object> parameters = new ArrayList<>();
         String sql = bind(query.getSql(), parameters);
-        if (countQuery) {
-            long count = entityManager.executeCountQuery(sql, parameters);
-            return (List<T>) List.of(count);
+        if (projection) {
+            List<Object> rows = entityManager.executeProjectionQuery(sql, parameters);
+            if (countQuery) {
+                List<T> normalized = new ArrayList<>(rows.size());
+                for (Object value : rows) {
+                    normalized.add(value instanceof Number number ? (T) Long.valueOf(number.longValue()) : (T) value);
+                }
+                return normalized;
+            }
+            return (List<T>) rows;
         }
         List<T> results = (List<T>) entityManager.executeSelectQuery(sql, parameters, resultClass, fetchDepth);
         if (!fetchPaths.isEmpty()) {
