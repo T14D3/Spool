@@ -442,6 +442,15 @@ public class EntityManager implements AutoCloseable {
     }
 
     /**
+     * True when a collection returned by a LAZY association is already
+     * materialized. Plain collections count as loaded; {@code null} is not.
+     * Never triggers a load, so callers can introspect wrappers safely.
+     */
+    public boolean isLoaded(Object collection) {
+        return RelationshipManager.isCollectionLoaded(collection);
+    }
+
+    /**
      * Find an entity by its ID.
      * <p>
      * Thread-safe: identity map and L2 cache lookups are lock-free.
@@ -1129,6 +1138,202 @@ public class EntityManager implements AutoCloseable {
             }
             return results;
         }
+    }
+
+    // ========================================================================
+    // Explicit fetch API
+    // ========================================================================
+
+    /**
+     * Explicit fetch: resolve all LAZY collections and single-reference stubs
+     * of one entity. Stubs never self-load; this is the API that fills them.
+     *
+     * @return the same entity, for chaining
+     */
+    public <T> T initialize(T entity) {
+        if (entity == null) {
+            throw new IllegalArgumentException("Cannot initialize null entity");
+        }
+        initializeAll(List.of(entity));
+        return entity;
+    }
+
+    /**
+     * Explicit fetch for a list of parents. LAZY collections are loaded with a
+     * bounded number of queries (one pair query plus one IN load per
+     * association, chunked at 500 ids) and single-reference stubs are resolved
+     * in batches.
+     */
+    public void initializeAll(Iterable<?> parents) {
+        if (parents == null) {
+            return;
+        }
+        List<Object> entities = new ArrayList<>();
+        for (Object parent : parents) {
+            if (parent != null) {
+                entities.add(parent);
+            }
+        }
+        if (entities.isEmpty()) {
+            return;
+        }
+        synchronized (connection) {
+            initializeSingleRefs(entities, null);
+            relationshipManager.initializeCollections(entities, null);
+        }
+    }
+
+    /**
+     * Batch-load ids in one IN query per chunk and attach the rows through the
+     * normal identity-map/hydration path.
+     */
+    <T> List<T> findManagedByIds(Class<T> entityClass, Collection<Object> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return new ArrayList<>();
+        }
+        EntityMetadata metadata = EntityMetadata.of(entityClass);
+        if (metadata.isCompositeId()) {
+            throw new UnsupportedOperationException(
+                    "Batch id lookups with a composite id are not supported: " + entityClass.getName());
+        }
+        List<Object> unique = new ArrayList<>(new LinkedHashSet<>(ids));
+        List<T> managed = new ArrayList<>(unique.size());
+        for (int i = 0; i < unique.size(); i += 500) {
+            List<Object> chunk = unique.subList(i, Math.min(i + 500, unique.size()));
+            String placeholders = String.join(", ", Collections.nCopies(chunk.size(), "?"));
+            Query q = Query.select(dialect, "*")
+                    .from(metadata.getTableName())
+                    .where(dialect.quoteIdentifier(metadata.getIdColumnName()) + " IN (" + placeholders + ")",
+                            chunk.toArray())
+                    .build();
+            managed.addAll(executeSelectQuery(q, entityClass));
+        }
+        return managed;
+    }
+
+    private record SingleRefRequest(Object entity, Field field, Class<?> targetClass, Object id) {}
+
+    /**
+     * Resolve single-reference values for {@code entities}. Forward references
+     * (ManyToOne / owning OneToOne) are loaded in batches; lazy inverse
+     * OneToOne is fetched per entity. When {@code onlyField} is set, only that
+     * association is resolved (HQL JOIN FETCH).
+     */
+    void initializeSingleRefs(List<?> entities, String onlyField) {
+        List<SingleRefRequest> requests = new ArrayList<>();
+        for (Object entity : entities) {
+            if (entity == null) {
+                continue;
+            }
+            EntityMetadata metadata = EntityMetadata.of(entity.getClass());
+            for (var relationship : relationshipManager.getRelationshipMappings(metadata)) {
+                if (onlyField != null && !onlyField.equals(relationship.field().getName())) {
+                    continue;
+                }
+                if (relationship.relationshipType() == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_ONE
+                        && !relationship.isOwningSide()) {
+                    if (metadata.getFieldValue(entity, relationship.field()) == null) {
+                        relationshipManager.initializeInverseOneToOne(entity, metadata);
+                    }
+                    continue;
+                }
+                boolean forward = relationship.relationshipType()
+                        == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_ONE
+                        || (relationship.relationshipType()
+                        == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_ONE
+                        && relationship.isOwningSide());
+                if (!forward) {
+                    continue;
+                }
+                Class<?> targetClass = relationship.targetEntity();
+                if (targetClass == Object.class || targetClass == void.class) {
+                    continue;
+                }
+                Object value = metadata.getFieldValue(entity, relationship.field());
+                if (value == null) {
+                    continue;
+                }
+                EntityMetadata targetMeta = EntityMetadata.of(targetClass);
+                if (targetMeta.isCompositeId()) {
+                    continue;
+                }
+                EntityId id = targetMeta.getEntityId(value);
+                if (!id.isComplete()) {
+                    continue;
+                }
+                Object idValue = id.singleValue();
+                Object existing = identityMap.get(
+                        new EntityKey(targetClass, targetMeta.getEntityIdFrom(idValue)));
+                if (existing != null) {
+                    metadata.setFieldValue(entity, relationship.field(), existing);
+                    continue;
+                }
+                requests.add(new SingleRefRequest(entity, relationship.field(), targetClass, idValue));
+            }
+        }
+        if (requests.isEmpty()) {
+            return;
+        }
+
+        Map<Class<?>, Set<Object>> idsByClass = new LinkedHashMap<>();
+        for (SingleRefRequest request : requests) {
+            idsByClass.computeIfAbsent(request.targetClass(), key -> new LinkedHashSet<>()).add(request.id());
+        }
+        Map<Class<?>, Map<Object, Object>> loadedByClass = new HashMap<>();
+        for (Map.Entry<Class<?>, Set<Object>> entry : idsByClass.entrySet()) {
+            EntityMetadata targetMeta = EntityMetadata.of(entry.getKey());
+            Map<Object, Object> byId = new LinkedHashMap<>();
+            for (Object managed : findManagedByIds(entry.getKey(), entry.getValue())) {
+                EntityId id = targetMeta.getEntityId(managed);
+                if (id.isComplete()) {
+                    byId.put(id.singleValue(), managed);
+                }
+            }
+            loadedByClass.put(entry.getKey(), byId);
+        }
+        for (SingleRefRequest request : requests) {
+            Object managed = loadedByClass.getOrDefault(request.targetClass(), Map.of()).get(request.id());
+            if (managed != null) {
+                EntityMetadata.of(request.entity().getClass())
+                        .setFieldValue(request.entity(), request.field(), managed);
+            }
+        }
+    }
+
+    /**
+     * Apply HQL {@code JOIN FETCH} paths to a result list: each path triggers a
+     * bounded batched load (single query per class per path, chunked at 500).
+     */
+    public void applyFetchPaths(List<?> rows, List<de.t14d3.spool.query.hql.HqlQuery.FetchPath> paths) {
+        if (rows == null || rows.isEmpty() || paths == null || paths.isEmpty()) {
+            return;
+        }
+        synchronized (connection) {
+            for (de.t14d3.spool.query.hql.HqlQuery.FetchPath path : paths) {
+                var mapping = findRelationship(path.entityClass(), path.fieldName());
+                if (mapping == null) {
+                    throw new IllegalStateException("JOIN FETCH field is not a relationship: "
+                            + path.entityClass().getSimpleName() + "." + path.fieldName());
+                }
+                if (mapping.relationshipType()
+                        == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.ONE_TO_MANY
+                        || mapping.relationshipType()
+                        == de.t14d3.spool.mapping.RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+                    relationshipManager.initializeCollections(rows, path.fieldName());
+                } else {
+                    initializeSingleRefs(rows, path.fieldName());
+                }
+            }
+        }
+    }
+
+    private de.t14d3.spool.mapping.RelationshipMapping findRelationship(Class<?> entityClass, String fieldName) {
+        for (var mapping : relationshipManager.getRelationshipMappings(EntityMetadata.of(entityClass))) {
+            if (mapping.field().getName().equals(fieldName)) {
+                return mapping;
+            }
+        }
+        return null;
     }
 
     /**

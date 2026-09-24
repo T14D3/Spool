@@ -33,26 +33,37 @@ public final class HqlQuery {
     record ParamRef(boolean list, String name, Integer position) {
     }
 
+    /**
+     * A {@code JOIN FETCH} target: the association is batch-loaded after the
+     * main query runs, so a path costs one extra bounded query (chunked at
+     * 500 ids), never one query per row.
+     */
+    public record FetchPath(Class<?> entityClass, String fieldName) {
+    }
+
     private final EntityManager entityManager;
     private final Class<?> resultClass;
     private final Query.SelectBuilder builder;
     private final List<ParamRef> paramRefs;
+    private final List<FetchPath> fetchPaths;
     private final boolean countQuery;
     private final Map<String, Object> namedParameters = new HashMap<>();
     private final Map<Integer, Object> positionalParameters = new HashMap<>();
 
     HqlQuery(EntityManager entityManager, Class<?> resultClass, Query.SelectBuilder builder,
-             List<ParamRef> paramRefs, boolean countQuery) {
+             List<ParamRef> paramRefs, boolean countQuery, List<FetchPath> fetchPaths) {
         this.entityManager = entityManager;
         this.resultClass = resultClass;
         this.builder = builder;
         this.paramRefs = List.copyOf(paramRefs);
         this.countQuery = countQuery;
+        this.fetchPaths = List.copyOf(fetchPaths);
     }
 
     public static HqlQuery parse(EntityManager entityManager, String hql) {
         HqlParser.Parsed parsed = new HqlParser(entityManager.getDialect(), hql).parse();
-        return new HqlQuery(entityManager, parsed.entityClass(), parsed.builder(), parsed.params(), parsed.countQuery());
+        return new HqlQuery(entityManager, parsed.entityClass(), parsed.builder(), parsed.params(),
+                parsed.countQuery(), parsed.fetchPaths());
     }
 
     /**
@@ -137,7 +148,11 @@ public final class HqlQuery {
             long count = entityManager.executeCountQuery(sql, parameters);
             return (List<T>) List.of(count);
         }
-        return (List<T>) entityManager.executeSelectQuery(sql, parameters, resultClass);
+        List<T> results = (List<T>) entityManager.executeSelectQuery(sql, parameters, resultClass);
+        if (!fetchPaths.isEmpty()) {
+            entityManager.applyFetchPaths((List<Object>) (List<?>) results, fetchPaths);
+        }
+        return results;
     }
 
     /**

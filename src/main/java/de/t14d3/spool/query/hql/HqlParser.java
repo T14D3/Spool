@@ -1,6 +1,8 @@
 package de.t14d3.spool.query.hql;
 
+import de.t14d3.spool.annotations.ManyToMany;
 import de.t14d3.spool.annotations.ManyToOne;
+import de.t14d3.spool.annotations.OneToMany;
 import de.t14d3.spool.annotations.OneToOne;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.query.Dialect;
@@ -18,6 +20,7 @@ import java.util.Map;
  * Supported grammar:
  * <pre>
  *   SELECT (&lt;alias&gt;|*) FROM &lt;Entity&gt; &lt;alias&gt;
+ *     [JOIN FETCH &lt;alias&gt;.&lt;path&gt;]...
  *     [WHERE &lt;condition&gt;]
  *     [ORDER BY &lt;path&gt; [ASC|DESC], ...]
  *     [LIMIT &lt;n&gt;]
@@ -35,7 +38,7 @@ import java.util.Map;
 final class HqlParser {
 
     record Parsed(Class<?> entityClass, Query.SelectBuilder builder, List<HqlQuery.ParamRef> params,
-                  boolean countQuery) {
+                  boolean countQuery, List<HqlQuery.FetchPath> fetchPaths) {
     }
 
     private final Dialect dialect;
@@ -98,6 +101,38 @@ final class HqlParser {
         builder = Query.select(dialect, countQuery ? "COUNT(*)" : "*")
                 .from(baseMetadata.getTableName(), baseAlias);
 
+        List<HqlQuery.FetchPath> fetchPaths = new ArrayList<>();
+        while (peekKind(0) == HqlLexer.Kind.JOIN
+                || peekKind(0) == HqlLexer.Kind.LEFT
+                || peekKind(0) == HqlLexer.Kind.INNER) {
+            if (peekKind(0) == HqlLexer.Kind.JOIN) {
+                index++;
+            } else {
+                index++;
+                expect(HqlLexer.Kind.JOIN);
+            }
+            expect(HqlLexer.Kind.FETCH);
+            String fetchAlias = expect(HqlLexer.Kind.IDENT).text();
+            if (!fetchAlias.equals(baseAlias)) {
+                throw new HqlException(
+                        "JOIN FETCH alias '" + fetchAlias + "' does not match FROM alias '" + baseAlias + "'");
+            }
+            expect(HqlLexer.Kind.DOT);
+            String fieldName = expect(HqlLexer.Kind.IDENT).text();
+            Field field = baseMetadata.getFieldByName(fieldName);
+            if (field == null) {
+                throw new HqlException("Unknown field for JOIN FETCH: " + baseAlias + "." + fieldName);
+            }
+            if (!field.isAnnotationPresent(ManyToOne.class)
+                    && !field.isAnnotationPresent(OneToOne.class)
+                    && !field.isAnnotationPresent(OneToMany.class)
+                    && !field.isAnnotationPresent(ManyToMany.class)) {
+                throw new HqlException("JOIN FETCH target is not a relationship: "
+                        + baseAlias + "." + fieldName);
+            }
+            fetchPaths.add(new HqlQuery.FetchPath(entityClass, fieldName));
+        }
+
         if (match(HqlLexer.Kind.WHERE)) {
             builder.where(parseOr());
         }
@@ -116,7 +151,7 @@ final class HqlParser {
         }
         expect(HqlLexer.Kind.EOF);
 
-        return new Parsed(entityClass, builder, params, countQuery);
+        return new Parsed(entityClass, builder, params, countQuery, fetchPaths);
     }
 
     private String parseQualifiedName() {

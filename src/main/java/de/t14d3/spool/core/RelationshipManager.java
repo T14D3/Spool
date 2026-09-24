@@ -6,9 +6,13 @@ import de.t14d3.spool.annotations.OneToMany;
 import de.t14d3.spool.mapping.EntityId;
 import de.t14d3.spool.mapping.EntityMetadata;
 import de.t14d3.spool.mapping.RelationshipMapping;
+import de.t14d3.spool.mapping.TypeMapper;
 import de.t14d3.spool.query.Query;
 
 import java.lang.reflect.Field;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -515,6 +519,270 @@ public class RelationshipManager {
                 .build();
         List<?> rows = entityManager.executeSelectQuery(q, relationship.targetEntity());
         return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    // ========================================================================
+    // Explicit fetch: batched collection initialization
+    // ========================================================================
+
+    /**
+     * Batch-load collection associations for a list of parents. Issues one pair
+     * query plus one entity load per association (chunked at 500 ids), instead
+     * of one query per parent. When {@code onlyField} is non-null, only that
+     * association is initialized.
+     * <p>
+     * Parents already loaded through this EntityManager have lazy wrappers;
+     * wrappers already marked loaded are skipped. Other parents get a fresh
+     * loaded wrapper holding the fetched items.
+     */
+    public void initializeCollections(List<?> entities, String onlyField) {
+        if (entities == null || entities.isEmpty()) {
+            return;
+        }
+        Map<Class<?>, List<Object>> byClass = new LinkedHashMap<>();
+        for (Object entity : entities) {
+            if (entity != null) {
+                byClass.computeIfAbsent(entity.getClass(), key -> new ArrayList<>()).add(entity);
+            }
+        }
+        for (Map.Entry<Class<?>, List<Object>> entry : byClass.entrySet()) {
+            EntityMetadata metadata = EntityMetadata.of(entry.getKey());
+            for (RelationshipMapping relationship : getRelationships(metadata)) {
+                if (relationship.relationshipType() != RelationshipMapping.RelationshipType.ONE_TO_MANY
+                        && relationship.relationshipType() != RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+                    continue;
+                }
+                if (onlyField != null && !onlyField.equals(relationship.field().getName())) {
+                    continue;
+                }
+                initializeCollectionAssociation(entry.getValue(), metadata, relationship);
+            }
+        }
+    }
+
+    private void initializeCollectionAssociation(
+            List<Object> parents,
+            EntityMetadata metadata,
+            RelationshipMapping relationship) {
+        List<Object> pending = new ArrayList<>();
+        for (Object parent : parents) {
+            Object value = getFieldValue(parent, relationship.field());
+            if (value instanceof LazyCollection lazy && lazy.isLoaded()) {
+                continue;
+            }
+            if (metadata.getEntityId(parent).isComplete()) {
+                pending.add(parent);
+            }
+        }
+        if (pending.isEmpty()) {
+            return;
+        }
+        if (metadata.isCompositeId()) {
+            throw new UnsupportedOperationException(
+                    "Collection initialization with a composite-id owner is not supported: "
+                            + metadata.getEntityClass().getName());
+        }
+
+        Field mappedByField = null;
+        Map<Object, List<Object>> grouped;
+        if (relationship.relationshipType() == RelationshipMapping.RelationshipType.ONE_TO_MANY) {
+            if (!relationship.isOwningSide()) {
+                mappedByField = EntityMetadata.findField(relationship.targetEntity(), relationship.mappedBy());
+            }
+            grouped = loadOneToManyBatch(pending, metadata, relationship);
+        } else {
+            if (relationship.targetEntity() == Object.class) {
+                return;
+            }
+            grouped = loadManyToManyBatch(pending, metadata, relationship);
+        }
+
+        for (Object parent : pending) {
+            Object ownerId = metadata.getIdValue(parent);
+            List<Object> items = grouped.getOrDefault(ownerId, List.of());
+            if (mappedByField != null) {
+                for (Object child : items) {
+                    setFieldValue(child, mappedByField, parent);
+                }
+            }
+            applyLoadedCollection(parent, relationship, items);
+        }
+
+        if (relationship.relationshipType() == RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+            Field ownerField = relationship.field();
+            Field inverseField = resolveManyToManyInverseField(
+                    metadata.getEntityClass(), ownerField, relationship.targetEntity(), relationship.mappedBy());
+            if (inverseField != null) {
+                for (Object parent : pending) {
+                    for (Object related : grouped.getOrDefault(metadata.getIdValue(parent), List.of())) {
+                        syncManyToManyInverse(parent, related, inverseField, ownerField);
+                    }
+                }
+            }
+        }
+    }
+
+    private void applyLoadedCollection(Object parent, RelationshipMapping relationship, List<Object> items) {
+        Object value = getFieldValue(parent, relationship.field());
+        if (value instanceof LazyCollection lazy) {
+            lazy.attachLoader(() -> lazy.replaceContents(items));
+            lazy.ensureLoaded();
+            return;
+        }
+
+        if (relationship.relationshipType() == RelationshipMapping.RelationshipType.MANY_TO_MANY) {
+            Field ownerField = relationship.field();
+            Field inverseField = resolveManyToManyInverseField(
+                    metadataFor(parent).getEntityClass(), ownerField, relationship.targetEntity(), relationship.mappedBy());
+            if (inverseField != null) {
+                wrapManyToManyCollection(parent, ownerField, inverseField);
+                Object wrapped = getFieldValue(parent, ownerField);
+                if (wrapped instanceof LazyCollection lazy) {
+                    lazy.attachLoader(() -> lazy.replaceContents(items));
+                    lazy.ensureLoaded();
+                    return;
+                }
+            }
+        }
+
+        LazyCollection wrapper = createLazyCollection(relationship.field(), mutationTracker(parent, relationship));
+        if (wrapper != null) {
+            wrapper.replaceContents(items);
+            setFieldValue(parent, relationship.field(), wrapper);
+        }
+    }
+
+    private static EntityMetadata metadataFor(Object entity) {
+        return EntityMetadata.of(entity.getClass());
+    }
+
+    private Map<Object, List<Object>> loadOneToManyBatch(
+            List<Object> parents,
+            EntityMetadata metadata,
+            RelationshipMapping relationship) {
+        Class<?> targetEntity = relationship.targetEntity();
+        EntityMetadata targetMeta = EntityMetadata.of(targetEntity);
+        String fkColumn;
+        if (relationship.isOwningSide()) {
+            fkColumn = relationship.joinColumn();
+        } else {
+            Field mappedByField = EntityMetadata.findField(targetEntity, relationship.mappedBy());
+            if (mappedByField == null) {
+                throw new IllegalStateException("OneToMany mappedBy field not found: "
+                        + targetEntity.getName() + "." + relationship.mappedBy());
+            }
+            fkColumn = targetMeta.getColumnName(mappedByField);
+        }
+        if (fkColumn == null || fkColumn.isBlank()) {
+            throw new IllegalStateException("OneToMany association has no FK column: "
+                    + metadata.getEntityClass().getName() + "." + relationship.field().getName());
+        }
+
+        List<Object> ownerIds = new ArrayList<>(parents.size());
+        for (Object parent : parents) {
+            ownerIds.add(metadata.getIdValue(parent));
+        }
+        Map<Object, List<Object>> childIdsByOwner = loadPairIds(
+                targetMeta.getTableName(),
+                fkColumn,
+                targetMeta.getIdColumnName(),
+                ownerIds,
+                metadata.getIdField().getType(),
+                targetMeta.getIdField().getType());
+        return loadGroupedTargets(childIdsByOwner, targetEntity, targetMeta);
+    }
+
+    private Map<Object, List<Object>> loadManyToManyBatch(
+            List<Object> parents,
+            EntityMetadata metadata,
+            RelationshipMapping relationship) {
+        EntityManager.ManyToManyJoinTable join = entityManager.resolveManyToManyJoinTable(metadata, relationship);
+        if (join == null) {
+            return new LinkedHashMap<>();
+        }
+        EntityMetadata targetMeta = EntityMetadata.of(relationship.targetEntity());
+        List<Object> ownerIds = new ArrayList<>(parents.size());
+        for (Object parent : parents) {
+            ownerIds.add(metadata.getIdValue(parent));
+        }
+        Map<Object, List<Object>> otherIdsByOwner = loadPairIds(
+                join.joinTable(),
+                join.thisColumn(),
+                join.otherColumn(),
+                ownerIds,
+                metadata.getIdField().getType(),
+                targetMeta.getIdField().getType());
+        return loadGroupedTargets(otherIdsByOwner, relationship.targetEntity(), targetMeta);
+    }
+
+    private Map<Object, List<Object>> loadGroupedTargets(
+            Map<Object, List<Object>> idsByOwner,
+            Class<?> targetEntity,
+            EntityMetadata targetMeta) {
+        Set<Object> allIds = new LinkedHashSet<>();
+        for (List<Object> ids : idsByOwner.values()) {
+            allIds.addAll(ids);
+        }
+        if (allIds.isEmpty()) {
+            return new LinkedHashMap<>();
+        }
+        List<?> targets = entityManager.findManagedByIds(targetEntity, allIds);
+        Map<Object, Object> byId = new LinkedHashMap<>();
+        for (Object target : targets) {
+            EntityId id = targetMeta.getEntityId(target);
+            if (id.isComplete()) {
+                byId.put(id.singleValue(), target);
+            }
+        }
+        Map<Object, List<Object>> grouped = new LinkedHashMap<>();
+        for (Map.Entry<Object, List<Object>> entry : idsByOwner.entrySet()) {
+            List<Object> resolved = new ArrayList<>();
+            for (Object id : entry.getValue()) {
+                Object target = byId.get(id);
+                if (target != null) {
+                    resolved.add(target);
+                }
+            }
+            grouped.put(entry.getKey(), resolved);
+        }
+        return grouped;
+    }
+
+    /**
+     * Loads {@code (fk, id)} pairs from {@code table} where the FK column is in
+     * {@code ownerIds}, chunked to keep IN lists small.
+     */
+    private Map<Object, List<Object>> loadPairIds(
+            String table,
+            String fkColumn,
+            String idColumn,
+            List<Object> ownerIds,
+            Class<?> fkType,
+            Class<?> idType) {
+        Map<Object, List<Object>> grouped = new LinkedHashMap<>();
+        for (int i = 0; i < ownerIds.size(); i += 500) {
+            List<Object> chunk = ownerIds.subList(i, Math.min(i + 500, ownerIds.size()));
+            String placeholders = String.join(", ", Collections.nCopies(chunk.size(), "?"));
+            Query query = Query.select(entityManager.getDialect(), fkColumn, idColumn)
+                    .from(table)
+                    .where(entityManager.getDialect().quoteIdentifier(fkColumn) + " IN (" + placeholders + ")",
+                            chunk.toArray())
+                    .build();
+            try (PreparedStatement stmt = entityManager.getExecutor().getConnection().prepareStatement(query.getSql())) {
+                SqlExecutor.setParameters(stmt, query.getParameters());
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        Object fk = TypeMapper.convertToJavaType(rs.getObject(1), fkType);
+                        Object id = TypeMapper.convertToJavaType(rs.getObject(2), idType);
+                        grouped.computeIfAbsent(fk, key -> new ArrayList<>()).add(id);
+                    }
+                }
+            } catch (SQLException e) {
+                throw new RuntimeException(
+                        "Failed to batch-load relationship rows from " + table + "." + fkColumn, e);
+            }
+        }
+        return grouped;
     }
 
     /**
@@ -1061,6 +1329,20 @@ public class RelationshipManager {
      */
     static boolean isMutationTracked(Object value) {
         return value instanceof LazyCollection lazy && lazy.hasMutationTracker();
+    }
+
+    /**
+     * True when {@code value} is a materialized collection: a lazy wrapper that
+     * has loaded, or a plain collection. Never triggers a load.
+     */
+    static boolean isCollectionLoaded(Object value) {
+        if (value == null) {
+            return false;
+        }
+        if (value instanceof LazyCollection lazy) {
+            return lazy.isLoaded();
+        }
+        return value instanceof Collection<?>;
     }
 
     /**

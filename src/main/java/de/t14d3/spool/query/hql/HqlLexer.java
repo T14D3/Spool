@@ -16,6 +16,7 @@ final class HqlLexer {
 
     enum Kind {
         SELECT, FROM, WHERE, ORDER, BY, ASC, DESC, LIMIT,
+        JOIN, FETCH, LEFT, INNER,
         AND, OR, NOT, IN, IS, NULL, LIKE, TRUE, FALSE,
         IDENT, NUMBER, STRING, NAMED_PARAM, POSITIONAL_PARAM,
         LPAREN, RPAREN, COMMA, DOT, STAR,
@@ -35,6 +36,10 @@ final class HqlLexer {
             Map.entry("ASC", Kind.ASC),
             Map.entry("DESC", Kind.DESC),
             Map.entry("LIMIT", Kind.LIMIT),
+            Map.entry("JOIN", Kind.JOIN),
+            Map.entry("FETCH", Kind.FETCH),
+            Map.entry("LEFT", Kind.LEFT),
+            Map.entry("INNER", Kind.INNER),
             Map.entry("AND", Kind.AND),
             Map.entry("OR", Kind.OR),
             Map.entry("NOT", Kind.NOT),
