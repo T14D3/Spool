@@ -1010,6 +1010,10 @@ public class EntityManager implements AutoCloseable {
         identityMap.clear();
         originalValues.clear();
         detachedEntities.clear();
+        // Drop relationship-dirty flags: their keys point at entities that are
+        // no longer managed, so a later reload with the same class + id would
+        // otherwise trigger a spurious join-table sync on the next flush.
+        dirtyManyToMany.clear();
     }
 
     /** Atomically drain a concurrent queue (discard all items). */
@@ -1527,6 +1531,8 @@ public class EntityManager implements AutoCloseable {
         @SuppressWarnings("unchecked")
         T existing = (T) identityMap.get(key);
         if (existing != null) {
+            // Identity-map hit: @PreLoad fired when this instance was first
+            // attached and is not fired again (see SPOOL_USAGE.md).
             return existing;
         }
 

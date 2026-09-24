@@ -7,14 +7,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -106,46 +101,5 @@ public class BatchFetchTest {
 
     private static void assertSame(Object expected, Object actual) {
         org.junit.jupiter.api.Assertions.assertSame(expected, actual);
-    }
-
-    /**
-     * Counts calls to {@code prepareStatement} on the shared JDBC connection.
-     */
-    private static final class QueryCountingConnection implements InvocationHandler {
-        private final Connection delegate;
-        private final AtomicInteger preparedStatements = new AtomicInteger();
-        private final Connection proxy;
-
-        private QueryCountingConnection(Connection delegate) {
-            this.delegate = delegate;
-            this.proxy = (Connection) Proxy.newProxyInstance(
-                    Connection.class.getClassLoader(),
-                    new Class<?>[]{Connection.class},
-                    this);
-        }
-
-        Connection getProxy() {
-            return proxy;
-        }
-
-        void reset() {
-            preparedStatements.set(0);
-        }
-
-        int getPreparedStatements() {
-            return preparedStatements.get();
-        }
-
-        @Override
-        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-            if ("prepareStatement".equals(method.getName())) {
-                preparedStatements.incrementAndGet();
-            }
-            try {
-                return method.invoke(delegate, args);
-            } catch (InvocationTargetException e) {
-                throw e.getCause();
-            }
-        }
     }
 }

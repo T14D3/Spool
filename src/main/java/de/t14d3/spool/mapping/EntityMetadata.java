@@ -4,12 +4,17 @@ import de.t14d3.spool.annotations.Column;
 import de.t14d3.spool.annotations.Entity;
 import de.t14d3.spool.annotations.Id;
 import de.t14d3.spool.annotations.JoinColumn;
+import de.t14d3.spool.annotations.ManyToMany;
+import de.t14d3.spool.annotations.ManyToOne;
 import de.t14d3.spool.annotations.OneToMany;
+import de.t14d3.spool.annotations.OneToOne;
 import de.t14d3.spool.annotations.Table;
 import de.t14d3.spool.annotations.UniqueConstraint;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -67,6 +72,7 @@ public class EntityMetadata {
 
         for (Field field : entityClass.getDeclaredFields()) {
             field.setAccessible(true);
+            validateRelationshipField(field);
 
             if (field.isAnnotationPresent(de.t14d3.spool.annotations.Version.class)) {
                 if (field.isAnnotationPresent(Id.class)) {
@@ -135,10 +141,6 @@ public class EntityMetadata {
                         : field.getName() + "_id";
                 columnToField.put(columnName, field);
                 fieldToColumn.put(field, columnName);
-            } else if (field.isAnnotationPresent(OneToMany.class)) {
-                // @OneToMany fields don't have direct database columns but are part of relationships
-                // We don't add them to the fields list as they're not direct columns
-                // but we should track them for relationship management
             }
         }
 
@@ -209,6 +211,113 @@ public class EntityMetadata {
         String[] sorted = columns.clone();
         java.util.Arrays.sort(sorted);
         return "uniq_" + tableName + "_" + String.join("_", sorted);
+    }
+
+    /**
+     * Validates one field's relationship annotation. A mapping Spool cannot
+     * honor must fail when the metadata is built; it is never dropped
+     * silently at query time.
+     * <p>
+     * This is the runtime half of the explicitness contract and the logic the
+     * (future) annotation processor must share so the two cannot disagree.
+     */
+    private static void validateRelationshipField(Field field) {
+        Class<?> declaring = field.getDeclaringClass();
+
+        OneToMany oneToMany = field.getAnnotation(OneToMany.class);
+        if (oneToMany != null) {
+            if (!Collection.class.isAssignableFrom(field.getType())) {
+                throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToMany field '"
+                        + field.getName() + "' must be a Collection, found " + field.getType().getName());
+            }
+            String mappedBy = oneToMany.mappedBy();
+            if (mappedBy == null || mappedBy.isBlank()) {
+                throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToMany field '"
+                        + field.getName() + "' has a blank mappedBy; unidirectional @OneToMany (join-column) "
+                        + "is not supported. Add the owning @ManyToOne field on "
+                        + oneToMany.targetEntity().getSimpleName() + " and set mappedBy to its name.");
+            }
+            Field inverse = declaredField(oneToMany.targetEntity(), mappedBy);
+            if (inverse == null) {
+                throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToMany field '"
+                        + field.getName() + "' declares mappedBy='" + mappedBy + "' but "
+                        + oneToMany.targetEntity().getName() + " has no such field");
+            }
+            if (!inverse.isAnnotationPresent(ManyToOne.class)) {
+                throw new IllegalArgumentException("Entity " + declaring.getName() + " @OneToMany field '"
+                        + field.getName() + "' declares mappedBy='" + mappedBy + "' but "
+                        + oneToMany.targetEntity().getName() + "." + mappedBy
+                        + " is not annotated with @ManyToOne");
+            }
+            return;
+        }
+
+        ManyToMany manyToMany = field.getAnnotation(ManyToMany.class);
+        if (manyToMany != null) {
+            if (!Collection.class.isAssignableFrom(field.getType())) {
+                throw new IllegalArgumentException("Entity " + declaring.getName() + " @ManyToMany field '"
+                        + field.getName() + "' must be a Collection, found " + field.getType().getName());
+            }
+            Class<?> target = collectionElementType(field);
+            if (target == Object.class) {
+                throw new IllegalArgumentException("Entity " + declaring.getName() + " @ManyToMany field '"
+                        + field.getName() + "' must declare its element type (Collection<T>); "
+                        + "a raw collection would silently load nothing");
+            }
+            String mappedBy = manyToMany.mappedBy();
+            if (mappedBy != null && !mappedBy.isBlank()) {
+                Field inverse = declaredField(target, mappedBy);
+                if (inverse == null) {
+                    throw new IllegalArgumentException("Entity " + declaring.getName() + " @ManyToMany field '"
+                            + field.getName() + "' declares mappedBy='" + mappedBy + "' but "
+                            + target.getName() + " has no such field");
+                }
+                if (!inverse.isAnnotationPresent(ManyToMany.class)
+                        || !Collection.class.isAssignableFrom(inverse.getType())) {
+                    throw new IllegalArgumentException("Entity " + declaring.getName() + " @ManyToMany field '"
+                            + field.getName() + "' declares mappedBy='" + mappedBy + "' but "
+                            + target.getName() + "." + mappedBy + " is not a @ManyToMany collection");
+                }
+            }
+            return;
+        }
+
+        if (field.isAnnotationPresent(OneToOne.class)) {
+            throw new IllegalArgumentException("Entity " + declaring.getName() + " declares @OneToOne field '"
+                    + field.getName() + "'; Spool does not persist a foreign-key column for @OneToOne yet, so the "
+                    + "association would be silently lost. Model it as @ManyToOne until @OneToOne is supported.");
+        }
+    }
+
+    /**
+     * Resolves the element type of a {@code Collection<T>} field, returning
+     * {@code Object.class} when the field is not a parameterized collection.
+     */
+    public static Class<?> collectionElementType(Field field) {
+        Type t = field.getGenericType();
+        if (!(t instanceof ParameterizedType pt)) {
+            return Object.class;
+        }
+        Type[] args = pt.getActualTypeArguments();
+        if (args.length != 1) {
+            return Object.class;
+        }
+        Type arg = args[0];
+        if (arg instanceof Class<?> c) {
+            return c;
+        }
+        if (arg instanceof ParameterizedType apt && apt.getRawType() instanceof Class<?> c) {
+            return c;
+        }
+        return Object.class;
+    }
+
+    private static Field declaredField(Class<?> type, String name) {
+        try {
+            return type.getDeclaredField(name);
+        } catch (NoSuchFieldException e) {
+            return null;
+        }
     }
 
     /**

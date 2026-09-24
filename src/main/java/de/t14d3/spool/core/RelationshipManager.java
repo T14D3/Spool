@@ -9,8 +9,6 @@ import de.t14d3.spool.mapping.RelationshipMapping;
 import de.t14d3.spool.query.Query;
 
 import java.lang.reflect.Field;
-import java.lang.reflect.ParameterizedType;
-import java.lang.reflect.Type;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -347,7 +345,7 @@ public class RelationshipManager {
             var annotation = field.getAnnotation(de.t14d3.spool.annotations.ManyToMany.class);
             return new RelationshipMapping(
                     field,
-                    resolveCollectionElementType(field),
+                    EntityMetadata.collectionElementType(field),
                     RelationshipMapping.RelationshipType.MANY_TO_MANY,
                     annotation.mappedBy(),
                     annotation.fetch(),
@@ -466,7 +464,11 @@ public class RelationshipManager {
                 continue;
             }
             if (relationship.mappedBy() == null || relationship.mappedBy().isBlank()) {
-                continue;
+                // EntityMetadata rejects blank mappedBy when the metadata is
+                // built; reaching this means the mapping was constructed
+                // outside the metadata path.
+                throw new IllegalStateException("OneToMany without mappedBy: "
+                        + metadata.getEntityClass().getName() + "." + relationship.field().getName());
             }
 
             List<Object> children = loadOneToManyEntities(entity, metadata, relationship);
@@ -652,7 +654,8 @@ public class RelationshipManager {
 
     private void installLazyOneToMany(Object entity, EntityMetadata metadata, RelationshipMapping relationship) {
         if (relationship.mappedBy() == null || relationship.mappedBy().isBlank()) {
-            return;
+            throw new IllegalStateException("OneToMany without mappedBy: "
+                    + metadata.getEntityClass().getName() + "." + relationship.field().getName());
         }
         Object current = getFieldValue(entity, relationship.field());
         if (current instanceof LazyCollection lazy && !lazy.isLoaded()) {
@@ -900,25 +903,6 @@ public class RelationshipManager {
 
         setFieldValue(owner, field, created);
         return created;
-    }
-
-    private static Class<?> resolveCollectionElementType(Field field) {
-        Type t = field.getGenericType();
-        if (!(t instanceof ParameterizedType pt)) {
-            return Object.class;
-        }
-        Type[] args = pt.getActualTypeArguments();
-        if (args.length != 1) {
-            return Object.class;
-        }
-        Type arg = args[0];
-        if (arg instanceof Class<?> c) {
-            return c;
-        }
-        if (arg instanceof ParameterizedType apt && apt.getRawType() instanceof Class<?> c) {
-            return c;
-        }
-        return Object.class;
     }
 
     private static Field resolveManyToManyInverseField(Class<?> ownerEntity, Field ownerField, Class<?> targetEntity, String mappedBy) {
