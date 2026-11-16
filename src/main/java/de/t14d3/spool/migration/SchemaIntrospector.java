@@ -26,6 +26,13 @@ import java.util.stream.Collectors;
  * but falls back to vendor-specific queries when necessary (notably for SQLite).
  */
 public class SchemaIntrospector {
+    /**
+     * Matches a trailing, single-number length in a SQL type, e.g. the "(36)" of
+     * "VARCHAR(36)". Compound precisions such as "DECIMAL(38, 18)" do not match.
+     */
+    private static final java.util.regex.Pattern EMBEDDED_TYPE_LENGTH =
+            java.util.regex.Pattern.compile("\\s*\\(\\s*(\\d+)\\s*\\)\\s*$");
+
     private final Connection connection;
     private final Dialect dialect;
 
@@ -51,15 +58,18 @@ public class SchemaIntrospector {
 
         // Try the portable metadata approach first
         try {
+            String catalog = catalogForMetadata();
             String schema = resolveSchemaForMetadata();
             // Request only "TABLE" and include "VIEW" as well in some DBs user tables may be views
-            try (ResultSet rs = metaData.getTables(null, schema, "%", new String[]{"TABLE", "VIEW"})) {
+            try (ResultSet rs = metaData.getTables(catalog, schema, "%", new String[]{"TABLE", "VIEW"})) {
                 while (rs.next()) {
                     String tableName = rs.getString("TABLE_NAME");
                     String tableSchema = rs.getString("TABLE_SCHEM"); // may be null for sqlite
                     if (tableName == null) continue;
 
-                    // Filter out system schemas/tables
+                    // Filter out rows the driver may have returned for other
+                    // databases (MySQL ignores a null catalog) and system schemas.
+                    if (!matchesCatalog(rs.getString("TABLE_CAT"), catalog)) continue;
                     if (isSystemSchema(tableSchema)) continue;
                     if (isSystemTableName(tableName)) continue;
 
@@ -85,15 +95,18 @@ public class SchemaIntrospector {
 
         // Try quick metadata lookup first
         DatabaseMetaData metaData = connection.getMetaData();
+        String catalog = catalogForMetadata();
         String schema = resolveSchemaForMetadata();
 
         try {
             // Use getTables with explicit name pattern to be efficient
-            try (ResultSet rs = metaData.getTables(null, schema, tableName, new String[]{"TABLE", "VIEW"})) {
+            try (ResultSet rs = metaData.getTables(catalog, schema, tableName, new String[]{"TABLE", "VIEW"})) {
                 while (rs.next()) {
                     String tname = rs.getString("TABLE_NAME");
                     String tschema = rs.getString("TABLE_SCHEM");
-                    if (tname != null && tname.equalsIgnoreCase(tableName) && !isSystemSchema(tschema)) {
+                    if (tname != null && tname.equalsIgnoreCase(tableName)
+                            && !isSystemSchema(tschema)
+                            && matchesCatalog(rs.getString("TABLE_CAT"), catalog)) {
                         return true;
                     }
                 }
@@ -117,6 +130,7 @@ public class SchemaIntrospector {
         if (tableName == null || tableName.isEmpty()) return null;
 
         DatabaseMetaData metaData = connection.getMetaData();
+        String catalog = catalogForMetadata();
         String schema = resolveSchemaForMetadata();
 
         // Try metadata-based approach
@@ -124,13 +138,18 @@ public class SchemaIntrospector {
             // First locate the actual table name and schema via getTables
             String actualTable = null;
             String foundSchema = null;
-            try (ResultSet tablesRs = metaData.getTables(null, schema, tableName, new String[]{"TABLE", "VIEW"})) {
+            String foundCatalog = catalog;
+            try (ResultSet tablesRs = metaData.getTables(catalog, schema, tableName, new String[]{"TABLE", "VIEW"})) {
                 while (tablesRs.next()) {
                     String tname = tablesRs.getString("TABLE_NAME");
                     String tschema = tablesRs.getString("TABLE_SCHEM");
-                    if (tname != null && tname.equalsIgnoreCase(tableName) && !isSystemSchema(tschema)) {
+                    String tcatalog = tablesRs.getString("TABLE_CAT");
+                    if (tname != null && tname.equalsIgnoreCase(tableName)
+                            && !isSystemSchema(tschema)
+                            && matchesCatalog(tcatalog, catalog)) {
                         actualTable = tname;
                         foundSchema = tschema;
+                        foundCatalog = tcatalog != null ? tcatalog : catalog;
                         break;
                     }
                 }
@@ -138,13 +157,17 @@ public class SchemaIntrospector {
 
             if (actualTable == null) {
                 // maybe uppercase/lowercase variant
-                try (ResultSet tablesRs = metaData.getTables(null, schema, tableName.toUpperCase(), new String[]{"TABLE", "VIEW"})) {
+                try (ResultSet tablesRs = metaData.getTables(catalog, schema, tableName.toUpperCase(), new String[]{"TABLE", "VIEW"})) {
                     while (tablesRs.next()) {
                         String tname = tablesRs.getString("TABLE_NAME");
                         String tschema = tablesRs.getString("TABLE_SCHEM");
-                        if (tname != null && tname.equalsIgnoreCase(tableName) && !isSystemSchema(tschema)) {
+                        String tcatalog = tablesRs.getString("TABLE_CAT");
+                        if (tname != null && tname.equalsIgnoreCase(tableName)
+                                && !isSystemSchema(tschema)
+                                && matchesCatalog(tcatalog, catalog)) {
                             actualTable = tname;
                             foundSchema = tschema;
+                            foundCatalog = tcatalog != null ? tcatalog : catalog;
                             break;
                         }
                     }
@@ -161,7 +184,7 @@ public class SchemaIntrospector {
 
             // gather primary keys
             Set<String> primaryKeys = new HashSet<>();
-            try (ResultSet pkRs = metaData.getPrimaryKeys(null, foundSchema, actualTable)) {
+            try (ResultSet pkRs = metaData.getPrimaryKeys(foundCatalog, foundSchema, actualTable)) {
                 while (pkRs.next()) {
                     String col = pkRs.getString("COLUMN_NAME");
                     if (col != null) primaryKeys.add(col.toLowerCase());
@@ -172,12 +195,13 @@ public class SchemaIntrospector {
 
             // gather columns
             List<ColumnDefinition> columns = new ArrayList<>();
-            try (ResultSet colRs = metaData.getColumns(null, foundSchema, actualTable, "%")) {
+            try (ResultSet colRs = metaData.getColumns(foundCatalog, foundSchema, actualTable, "%")) {
                 while (colRs.next()) {
                     // Filter out system columns if any
                     String tname = colRs.getString("TABLE_NAME");
                     String tschema = colRs.getString("TABLE_SCHEM");
-                    if (tname == null || isSystemSchema(tschema)) continue;
+                    if (tname == null || isSystemSchema(tschema)
+                            || !matchesCatalog(colRs.getString("TABLE_CAT"), foundCatalog)) continue;
                     columns.add(buildColumnFromResultSet(colRs, primaryKeys));
                 }
             }
@@ -192,7 +216,7 @@ public class SchemaIntrospector {
 
             TableDefinition table = new TableDefinition(actualTable);
             for (ColumnDefinition c : columns) table.addColumn(c);
-            collectUniqueConstraints(metaData, foundSchema, actualTable, table);
+            collectUniqueConstraints(metaData, foundCatalog, foundSchema, actualTable, table);
             return table;
 
         } catch (SQLException e) {
@@ -210,7 +234,7 @@ public class SchemaIntrospector {
     private String resolveSchemaForMetadata() {
         // Choose schema argument for DatabaseMetaData calls depending on dialect and driver behavior.
         // H2: use connection.getSchema() or "PUBLIC" when null.
-        // PostgreSQL / MySQL: leave schema null (driver resolves default).
+        // PostgreSQL: leave schema null (the driver resolves the searched schema).
         // SQLite: should pass null to avoid driver errors.
         try {
             if (dialect == Dialect.H2) {
@@ -223,6 +247,45 @@ public class SchemaIntrospector {
         }
         // For SQLite and generic, use null
         return null;
+    }
+
+    /**
+     * Catalog argument for {@link DatabaseMetaData} lookups.
+     *
+     * <p>MySQL and MariaDB treat the database as the JDBC <em>catalog</em>. With a
+     * null catalog the driver happily returns tables from <em>every</em> database
+     * on the server, so a sibling schema (a test copy, a second Rapunzel install,
+     * any other application that happens to use the same table names) makes Spool
+     * believe the target database already has the table. The generated "migration"
+     * is then a differential ALTER against a table that does not exist in the
+     * target schema, and a genuinely empty database can never be initialised.
+     * Supplying the catalog pins every lookup to the connected database.</p>
+     *
+     * @return the catalog to pass to metadata lookups, or null when the dialect
+     *         does not separate catalog and schema (or the driver reports none)
+     */
+    private String catalogForMetadata() {
+        if (dialect != Dialect.MYSQL) {
+            return null;
+        }
+        try {
+            return connection.getCatalog();
+        } catch (SQLException ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Guards against drivers that ignore the catalog argument: a row whose
+     * reported catalog differs from the connected one is not part of this schema.
+     *
+     * @param tableCatalog the {@code TABLE_CAT} of a metadata row (may be null)
+     * @param catalog      the catalog the lookup asked for (may be null)
+     * @return true when the row belongs to the requested catalog
+     */
+    private static boolean matchesCatalog(String tableCatalog, String catalog) {
+        if (catalog == null || tableCatalog == null) return true;
+        return tableCatalog.equalsIgnoreCase(catalog);
     }
 
     private boolean isSystemSchema(String schema) {
@@ -320,12 +383,12 @@ public class SchemaIntrospector {
      * {@code ORDINAL_POSITION}, which is what
      * {@code CREATE UNIQUE INDEX} would also produce.</p>
      */
-    private void collectUniqueConstraints(DatabaseMetaData metaData, String foundSchema,
+    private void collectUniqueConstraints(DatabaseMetaData metaData, String foundCatalog, String foundSchema,
                                           String actualTable, TableDefinition table) throws SQLException {
         // Collect the primary-key columns first so we can skip the
         // primary-key index if the driver surfaces it here.
         java.util.Set<String> pkColumnsLower = new java.util.HashSet<>();
-        try (ResultSet pkRs = metaData.getPrimaryKeys(null, foundSchema, actualTable)) {
+        try (ResultSet pkRs = metaData.getPrimaryKeys(foundCatalog, foundSchema, actualTable)) {
             while (pkRs.next()) {
                 String col = pkRs.getString("COLUMN_NAME");
                 if (col != null) pkColumnsLower.add(col.toLowerCase());
@@ -335,7 +398,7 @@ public class SchemaIntrospector {
             // PK-index filter is best-effort.
         }
 
-        try (ResultSet idxRs = metaData.getIndexInfo(null, foundSchema, actualTable, true, false)) {
+        try (ResultSet idxRs = metaData.getIndexInfo(foundCatalog, foundSchema, actualTable, true, false)) {
             java.util.Map<String, java.util.List<String>> indexes = new java.util.LinkedHashMap<>();
             while (idxRs.next()) {
                 String idxName = idxRs.getString("INDEX_NAME");
@@ -574,6 +637,34 @@ public class SchemaIntrospector {
                     }
                 } else if (length == null) {
                     length = defaultVarcharLengthFor(lengthSourceType);
+                }
+            }
+
+            // A type written with an explicit length ("VARCHAR(36)", "CHAR(8)") carries
+            // its own length, and that string is what the DDL generator emits verbatim.
+            // @Column length() still holds its 255 default in that case, which made every
+            // comparison against the driver-reported length fail: each startup generated
+            // a MODIFY COLUMN for every such column, so validateSchema() reported an
+            // invalid schema forever. The explicit type is authoritative; a compound
+            // precision ("DECIMAL(38, 18)") is not a length and is left alone.
+            if (sqlType != null) {
+                java.util.regex.Matcher embedded = EMBEDDED_TYPE_LENGTH.matcher(sqlType);
+                if (embedded.find()) {
+                    try {
+                        length = Integer.parseInt(embedded.group(1));
+                    } catch (NumberFormatException ignored) {
+                        // Keep the declared length.
+                    }
+                }
+
+                // Only VARCHAR/CHAR compare by length across dialects. For everything
+                // else the driver reports a capacity that has nothing to do with the
+                // entity (@Column's length() default of 255 vs MariaDB's TEXT = 65535),
+                // so keeping it produced a MODIFY COLUMN for every TEXT/BLOB column on
+                // every startup and validateSchema() never returned true.
+                String upperType = sqlType.toUpperCase(java.util.Locale.ROOT);
+                if (!(upperType.startsWith("VARCHAR") || upperType.startsWith("CHAR"))) {
+                    length = null;
                 }
             }
 

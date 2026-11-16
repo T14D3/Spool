@@ -32,6 +32,17 @@ public final class EntityId {
         for (Field idField : idFields) {
             values.add(metadata.getFieldValue(entity, idField));
         }
+        // An auto-increment id that still holds its unset default (0 for a
+        // primitive int/long field) means "not inserted yet", not "id 0":
+        // generated keys start at 1. A primitive id field cannot be null, so
+        // zero is the only way to express "no id yet", and this class uses a
+        // null component for exactly that. Normalizing here keeps the
+        // transient/persisted distinction in one place, so every caller that
+        // asks isComplete() agrees on it.
+        if (values.size() == 1 && metadata.isAutoIncrement()
+                && metadata.isUnsetIdValue(values.get(0))) {
+            values.set(0, null);
+        }
         return new EntityId(values);
     }
 

@@ -81,6 +81,34 @@ public class ColumnTypeTest {
         System.out.println("✓ Default type inference still works for columns without type() specification");
     }
 
+    /**
+     * A type that carries its own length ("VARCHAR(36)") must expose that length on
+     * the column definition. @Column length() keeps its 255 default in that case, and
+     * the schema diff compared that default against the real, driver-reported length:
+     * every startup generated a MODIFY COLUMN for every such column and
+     * validateSchema() never returned true.
+     */
+    @Test
+    void testLengthEmbeddedInExplicitType() {
+        System.out.println("=== Testing Length Embedded In Explicit Type ===");
+
+        em.registerEntities(TestEntity.class);
+        SchemaIntrospector introspector = em.getMigrationManager().getIntrospector();
+        TableDefinition tableDef = introspector.buildTableDefinitionFromEntity(TestEntity.class);
+
+        assertTrue(tableDef.hasColumn("uuid_text"), "Should have uuid_text column");
+        ColumnDefinition uuidColumn = tableDef.getColumns().get("uuid_text");
+        assertEquals("VARCHAR(36)", uuidColumn.getSqlType(), "Explicit length stays in the type string");
+        assertEquals(36, uuidColumn.getLength(), "Length must come from the explicit VARCHAR(36) type");
+
+        assertTrue(tableDef.hasColumn("amount"), "Should have amount column");
+        ColumnDefinition amountColumn = tableDef.getColumns().get("amount");
+        assertEquals("DECIMAL(38, 18)", amountColumn.getSqlType(), "Compound precision stays untouched");
+        assertNull(amountColumn.getLength(), "A compound precision must not be read as a length");
+
+        System.out.println("✓ Explicit type lengths are exposed on the column definition");
+    }
+
     @Test
     void testNumericColumnType() throws SQLException {
         System.out.println("=== Testing Numeric Column Type ===");
@@ -139,6 +167,12 @@ class TestEntity {
 
     @Column(name = "weight")
     private float weight;
+
+    @Column(name = "uuid_text", type = "VARCHAR(36)")
+    private String uuidText;
+
+    @Column(name = "amount", type = "DECIMAL(38, 18)")
+    private java.math.BigDecimal amount;
 
     // Constructor, getters, setters omitted for brevity
     public TestEntity() {}

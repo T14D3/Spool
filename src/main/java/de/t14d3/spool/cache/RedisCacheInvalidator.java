@@ -12,7 +12,10 @@ import java.util.function.BiConsumer;
  * Redis-based cache invalidator that uses Redis pub/sub for broadcasting
  * cache invalidations across nodes.
  *
- * <p>This implementation requires a Redis server and uses the Jedis client.</p>
+ * <p>This implementation requires a Redis server and uses the Jedis client.
+ * Jedis is an optional dependency: it is not declared transitively by Spool.
+ * Applications that use this class must add {@code redis.clients:jedis} to
+ * their own runtime classpath.</p>
  *
  * @see CacheInvalidator
  */

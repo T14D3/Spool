@@ -62,6 +62,13 @@ public class EntityManager implements AutoCloseable {
     private final Set<Object> detachedEntities;
     private CacheProvider cacheProvider;
     private CacheEventSink cacheEventSink;
+    /**
+     * Cache events recorded by {@link #flushWork()} that are only published once the
+     * surrounding transaction has actually committed. Announcing them earlier let a
+     * remote peer invalidate its cache and immediately re-read uncommitted (stale)
+     * rows, and announced changes that a later rollback discarded.
+     */
+    private final java.util.Map<CacheKey, CacheEvent.Operation> pendingCacheEvents = new java.util.LinkedHashMap<>();
     private Duration cacheTtl;
     private boolean transactionActive;
     private boolean originalAutoCommit;
@@ -95,12 +102,16 @@ public class EntityManager implements AutoCloseable {
 
     /**
      * Create a new EntityManager with the given database connection URL.
+     *
+     * <p>The connection is self-healing: when the database session dies (server restart,
+     * idle timeout, network blip) the next use reopens it instead of failing for the
+     * remaining lifetime of the process. See {@link ReconnectingConnection}.</p>
      */
     public static EntityManager create(String jdbcUrl) {
         try {
             Connection connection = DriverManager.getConnection(jdbcUrl);
             Dialect dialect = Dialect.detectFromUrl(jdbcUrl);
-            return new EntityManager(connection, dialect);
+            return new EntityManager(ReconnectingConnection.wrap(jdbcUrl, null, null, connection), dialect);
         } catch (SQLException e) {
             throw new RuntimeException("Failed to create EntityManager connection", e);
         }
@@ -114,7 +125,7 @@ public class EntityManager implements AutoCloseable {
         try {
             Connection connection = DriverManager.getConnection(jdbcUrl, user, password);
             Dialect dialect = Dialect.detectFromUrl(jdbcUrl);
-            return new EntityManager(connection, dialect);
+            return new EntityManager(ReconnectingConnection.wrap(jdbcUrl, user, password, connection), dialect);
         } catch (SQLException e) {
             throw new RuntimeException("Failed to create EntityManager connection", e);
         }
@@ -122,6 +133,10 @@ public class EntityManager implements AutoCloseable {
 
     /**
      * Create a new EntityManager with an existing connection.
+     *
+     * <p>No reconnect wrapper is installed here: the caller owns this connection and is
+     * responsible for keeping it alive. Use {@link #create(String)} for the self-healing
+     * behaviour.</p>
      */
     public static EntityManager create(Connection connection) {
         Dialect dialect = detectDialect(connection);
@@ -181,6 +196,7 @@ public class EntityManager implements AutoCloseable {
      * @throws RuntimeException if the commit fails
      */
     public void commit() {
+        java.util.Map<CacheKey, CacheEvent.Operation> committed = null;
         synchronized (connection) {
             if (!transactionActive) {
                 throw new IllegalStateException("No active transaction to commit");
@@ -189,9 +205,18 @@ public class EntityManager implements AutoCloseable {
                 connection.commit();
                 connection.setAutoCommit(originalAutoCommit);
                 transactionActive = false;
+                if (!pendingCacheEvents.isEmpty()) {
+                    committed = new java.util.LinkedHashMap<>(pendingCacheEvents);
+                    pendingCacheEvents.clear();
+                }
             } catch (SQLException e) {
                 throw new RuntimeException("Failed to commit transaction", e);
             }
+        }
+        // Published outside the connection lock: sinks are user code (network sends,
+        // cache invalidation, listeners) and must not run while the lock is held.
+        if (committed != null) {
+            publishCacheEvents(committed);
         }
     }
 
@@ -214,6 +239,8 @@ public class EntityManager implements AutoCloseable {
                 transactionActive = false;
                 // Clear pending operations since they've been rolled back
                 clear();
+                // ...and never announce them to other servers.
+                pendingCacheEvents.clear();
             } catch (SQLException e) {
                 throw new RuntimeException("Failed to rollback transaction", e);
             }
@@ -783,7 +810,7 @@ public class EntityManager implements AutoCloseable {
                     processOrphanRemovals(entity, EntityMetadata.of(entity.getClass()));
                 }
 
-                publishCacheEvents(cacheEvents);
+                queueCacheEvents(cacheEvents);
             } catch (Exception e) {
                 // Restore identity map to pre-flush state.
                 identityMap.clear();
@@ -805,6 +832,8 @@ public class EntityManager implements AutoCloseable {
                         e.addSuppressed(rollbackEx);
                     }
                 }
+                // The failed flush must not announce cache events for writes that never landed.
+                pendingCacheEvents.clear();
 
                 // A unique-key violation is a recoverable application-level
                 // signal: re-find + update. Surface it as the typed
@@ -1100,6 +1129,8 @@ public class EntityManager implements AutoCloseable {
         // otherwise trigger a spurious join-table sync on the next flush.
         dirtyManyToMany.clear();
         dirtyOneToMany.clear();
+        // Discarded changes must not be announced either.
+        pendingCacheEvents.clear();
     }
 
     /** Atomically drain a concurrent queue (discard all items). */
@@ -1979,6 +2010,12 @@ public class EntityManager implements AutoCloseable {
         originalValues.put(key, takeSnapshotValues(entity, metadata));
         cacheProvider.put(CacheKey.of(entity.getClass(), id), takeEntitySnapshot(entity, metadata), cacheTtl);
         return entity;
+    }
+
+    private void queueCacheEvents(Map<CacheKey, CacheEvent.Operation> cacheEvents) {
+        for (Map.Entry<CacheKey, CacheEvent.Operation> entry : cacheEvents.entrySet()) {
+            recordCacheEvent(pendingCacheEvents, entry.getKey(), entry.getValue());
+        }
     }
 
     private void publishCacheEvents(Map<CacheKey, CacheEvent.Operation> cacheEvents) {

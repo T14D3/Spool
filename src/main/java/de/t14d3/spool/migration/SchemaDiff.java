@@ -320,8 +320,14 @@ public class SchemaDiff {
             return "BLOB";
         }
         if (type.equals("NUMERIC")) return "DECIMAL";
-        // MySQL/MariaDB store BOOLEAN as TINYINT(1) and report TINYINT.
+        // MySQL/MariaDB store BOOLEAN as TINYINT(1). Depending on the JDBC driver and
+        // its tinyInt1isBit setting the same column is reported as BOOLEAN, TINYINT or
+        // BIT, so all three have to compare equal - otherwise validateSchema() reports
+        // the schema as changed on every startup and updateSchema() re-issues a
+        // MODIFY COLUMN for every boolean column.
         if (dialect == Dialect.MYSQL && type.equals("BOOLEAN")) return "TINYINT";
+        if (dialect == Dialect.MYSQL && (type.equals("BIT") || type.equals("BIT(1)")
+                || type.equals("TINYINT") || type.equals("TINYINT(1)"))) return "TINYINT";
 
         return type;
     }

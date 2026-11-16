@@ -574,6 +574,27 @@ public class EntityMetadata {
         return autoIncrement;
     }
 
+    /**
+     * True when the given id value means "no id assigned yet".
+     * <p>
+     * A {@code null} id is always unset. For an auto-increment id the
+     * generated key is never {@code 0}, so a numeric zero counts as unset
+     * too. That matters for primitive id fields: an {@code int} id cannot be
+     * {@code null}, so zero is the only way to say "not persisted yet".
+     * <p>
+     * This is the single source of truth for that rule; both the insert path
+     * and the transient-detection path must agree on it.
+     */
+    public boolean isUnsetIdValue(Object idValue) {
+        if (idValue == null) {
+            return true;
+        }
+        if (!autoIncrement) {
+            return false;
+        }
+        return idValue instanceof Number n && n.longValue() == 0L;
+    }
+
     public List<Field> getFields() {
         return Collections.unmodifiableList(fields);
     }

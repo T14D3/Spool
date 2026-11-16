@@ -97,10 +97,17 @@ val processorJar = tasks.register<Jar>("processorJar") {
     from(processorSourceSet.output)
 }
 
+val jedisDependency = "redis.clients:jedis:5.2.0"
+
 dependencies {
 
-    implementation("org.reflections:reflections:0.10.2")
-    implementation("redis.clients:jedis:5.2.0")
+    // Jedis is only needed by the optional RedisCacheInvalidator. Consumers that
+    // use that class must add redis.clients:jedis themselves; keeping it
+    // compileOnly prevents every Spool consumer from inheriting the full Jedis
+    // graph (commons-pool2, org.json, ...). The -all convenience artifact still
+    // includes it below.
+    compileOnly(jedisDependency)
+    testImplementation(jedisDependency)
     implementation("com.google.code.gson:gson:2.11.0")
 
     testImplementation(platform("org.junit:junit-bom:5.10.0"))
@@ -124,6 +131,10 @@ tasks.jar {
     }
 }
 
+val optionalFatJarDependencies = configurations.detachedConfiguration(
+    dependencies.create(jedisDependency)
+)
+
 val fatJar = tasks.register<Jar>("fatJar") {
     group = "build"
     description = "Assembles a runnable jar containing dependencies."
@@ -138,7 +149,7 @@ val fatJar = tasks.register<Jar>("fatJar") {
     from(sourceSets.main.get().output)
     dependsOn(configurations.runtimeClasspath)
     from({
-        configurations.runtimeClasspath.get()
+        files(configurations.runtimeClasspath, optionalFatJarDependencies)
             .filter { it.name.endsWith(".jar") }
             .map { zipTree(it) }
     })

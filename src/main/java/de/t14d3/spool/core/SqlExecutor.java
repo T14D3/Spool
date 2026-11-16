@@ -249,10 +249,9 @@ public class SqlExecutor {
         if (!metadata.isAutoIncrement()) {
             return false;
         }
-        if (idValue == null) {
-            return true;
-        }
-        return idValue instanceof Number n && n.longValue() == 0L;
+        // The unset-id rule lives in EntityMetadata so that the insert path
+        // and the transient-detection path cannot disagree.
+        return metadata.isUnsetIdValue(idValue);
     }
 
     public void insert(Object entity, EntityMetadata metadata) {

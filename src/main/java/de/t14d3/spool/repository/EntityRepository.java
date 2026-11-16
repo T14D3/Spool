@@ -6,6 +6,10 @@ import de.t14d3.spool.query.LockMode;
 import de.t14d3.spool.query.Query;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -37,6 +41,115 @@ public class EntityRepository<T> {
         this.entityManager = entityManager;
         this.entityClass = entityClass;
         this.metadata = EntityMetadata.of(entityClass);
+    }
+
+    /**
+     * Creates a new repository whose entity class is taken from the type
+     * argument the concrete subclass binds.
+     * <p>
+     * A type argument is erased at runtime, so it cannot be read back from
+     * {@code T} directly. It can, however, be read from the generic
+     * superclass of the concrete repository: a subclass declared as
+     * {@code class CategoryRepository extends EntityRepository<Category>}
+     * pins {@code Category} in its type hierarchy, and that binding is
+     * recoverable by reflection.
+     * <p>
+     * This lets a repository subclass declare its entity type once:
+     * <pre>{@code
+     * public class CategoryRepository extends EntityRepository<Category> {
+     *     public CategoryRepository(EntityManager em) {
+     *         super(em);
+     *     }
+     * }
+     * }</pre>
+     * 
+     * @param entityManager the EntityManager to use for database operations
+     * @throws IllegalStateException if the entity class cannot be determined,
+     *         which is the case for a directly instantiated
+     *         {@code EntityRepository} or a subclass that binds a type
+     *         variable instead of a concrete class
+     */
+    protected EntityRepository(EntityManager entityManager) {
+        this.entityManager = entityManager;
+        this.entityClass = EntityRepository.<T>resolveEntityClass(getClass());
+        this.metadata = EntityMetadata.of(this.entityClass);
+        this.entityManager.registerEntities(entityClass);
+    }
+
+    /**
+     * Find the entity class a concrete repository subclass binds through its
+     * type hierarchy.
+     * <p>
+     * Walks up the generic superclass chain and returns the type argument
+     * bound at the point where {@link EntityRepository} is extended. Type
+     * variables are substituted along the way, so an intermediate generic
+     * repository does not break the lookup: for
+     * {@code class Inherited extends Middle<User>} with
+     * {@code class Middle<T> extends EntityRepository<T>}, the binding
+     * resolves to {@code User}.
+     * 
+     * @param repositoryClass the concrete repository class
+     * @return the bound entity class
+     * @throws IllegalStateException if no concrete class is bound
+     */
+    @SuppressWarnings("unchecked")
+    private static <E> Class<E> resolveEntityClass(Class<?> repositoryClass) {
+        // Maps the type variables of the class currently being examined to
+        // the types they were bound to by its subclass.
+        Map<TypeVariable<?>, Type> bindings = Map.of();
+
+        for (Class<?> current = repositoryClass; current != null; current = current.getSuperclass()) {
+            Type genericSuperclass = current.getGenericSuperclass();
+            if (!(genericSuperclass instanceof ParameterizedType parameterized)) {
+                if (current == EntityRepository.class) {
+                    break;
+                }
+                continue;
+            }
+            if (!(parameterized.getRawType() instanceof Class<?> rawClass)) {
+                continue;
+            }
+
+            Map<TypeVariable<?>, Type> nextBindings = new HashMap<>();
+            TypeVariable<?>[] parameters = rawClass.getTypeParameters();
+            Type[] arguments = parameterized.getActualTypeArguments();
+            for (int i = 0; i < parameters.length && i < arguments.length; i++) {
+                nextBindings.put(parameters[i], resolveType(arguments[i], bindings));
+            }
+
+            if (rawClass == EntityRepository.class) {
+                Type entityType = resolveType(arguments[0], bindings);
+                if (entityType instanceof Class<?> entityClass) {
+                    return (Class<E>) entityClass;
+                }
+                break;
+            }
+            bindings = nextBindings;
+        }
+        throw new IllegalStateException(
+                "Cannot determine the entity class for repository " + repositoryClass.getName()
+                        + ". Bind it in the type hierarchy, e.g."
+                        + " \"class " + repositoryClass.getSimpleName()
+                        + " extends EntityRepository<YourEntity>\","
+                        + " or call the constructor that takes the entity class explicitly.");
+    }
+
+    /**
+     * Substitute a type argument through the bindings collected so far.
+     */
+    private static Type resolveType(Type type, Map<TypeVariable<?>, Type> bindings) {
+        Type current = type;
+        for (int depth = 0; depth < 10; depth++) {
+            if (!(current instanceof TypeVariable<?> variable)) {
+                return current;
+            }
+            Type bound = bindings.get(variable);
+            if (bound == null) {
+                return current;
+            }
+            current = bound;
+        }
+        return current;
     }
 
     /**
